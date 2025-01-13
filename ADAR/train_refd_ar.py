@@ -13,8 +13,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src import utils
-from src.datasets.dataset import MLAADFDDataset, MLAADFD_AR_Dataset
-from src.models.w2v2_aasist import W2VAASIST, W2VAASIST_AR
+from src.datasets.dataset import MLAADFD_AR_Dataset
+from src.models.w2v2_aasist import W2VAASIST_AR
+from src.lossess import ArcMarginProduct, CenterLoss
 
 
 def parse_args():
@@ -111,7 +112,7 @@ def parse_args():
         "--base_loss",
         type=str,
         default="ce",
-        choices=["ce", "bce"],
+        choices=["ce"], # "bce"
         help="Loss for basic training",
     )
     
@@ -134,6 +135,24 @@ def parse_args():
         help="Resume training from given optimizer state",
         default=None,
     )
+    
+    # Additional loss functions
+    def float_or_str(value):
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    
+    parser.add_argument("--use_arc_margin", action="store_true", help="Use ArcMarginProduct")
+    parser.add_argument("--arc_s", type=float_or_str, default="auto", help="Scale parameter s for ArcMarginProduct")
+    parser.add_argument("--arc_m", type=float, default=0.05, help="Margin parameter m for ArcMarginProduct")
+    parser.add_argument("--easy_margin", type=bool, default=False, help="Use easy margin in ArcMarginProduct")
+    parser.add_argument("--optimize_arc_margin_weights", type=bool, default=True, help="Optimize ArcMarginProduct weights")
+    
+    parser.add_argument("--use_center_loss", action="store_true", help="Use CenterLoss")
+    parser.add_argument("--center_loss_weight", type=float, default=0.01, help="Weight for CenterLoss")
+    parser.add_argument("--resume_center_loss_optimizer", type=str, help="Resume training from given center loss optimizer state", default=None)
+    
     args = parser.parse_args()
 
     # Set seeds
@@ -161,7 +180,7 @@ def parse_args():
 
 
 def train(args):
-    # Load the train and dev data
+    # Load the train and dev data (only known classes)
     print("Loading training data...")
     training_set = MLAADFD_AR_Dataset(args.path_to_dataset, "train", segmented=args.is_segmented, emphasiser_args=args)
     print("\nLoading dev data...")
@@ -184,8 +203,33 @@ def train(args):
     
     start_epoch = 0
 
-    # Setup the model
+    # Setup the model to learn in-domain classess
     model = W2VAASIST_AR(args.feat_dim, args.num_classes, extractor_args=args).to(args.device)
+    
+    # Set up loss functions
+    if args.base_loss == "ce":
+        criterion = nn.CrossEntropyLoss()
+    else:
+        criterion = nn.BCELoss()
+        
+    if args.use_arc_margin:
+        print("[INFO] Using ArcFace Loss...")
+        arc_margin = ArcMarginProduct(
+            in_features=5 * 32, # Last hidden output size of W2VAASIST
+            out_features=args.num_classes,
+            s=args.arc_s,
+            m=args.arc_m,
+            easy_margin=args.easy_margin
+        ).to(args.device)
+        
+    if args.use_center_loss:
+        print("[INFO] Using Center Loss...")
+        center_loss_fn = CenterLoss(
+            num_classes=args.num_classes,
+            feat_dim=5 * 32, # Last hidden output size of W2VAASIST
+            use_gpu=(args.device.type == "cuda")
+        )
+        center_loss_optimizer = torch.optim.SGD(center_loss_fn.parameters(), lr=0.5) # Separate optimizer for center-loss parameters
     
     if args.resume_checkpoint and args.resume_epoch:
         print(f"Resuming training from checkpoint {args.resume_checkpoint} at epoch {args.resume_epoch}")
@@ -193,23 +237,22 @@ def train(args):
         
         start_epoch = int(args.resume_epoch)
         
+    # Main optimizer + arc_margin params (optional)
     feat_optimizer = torch.optim.Adam(
-        model.parameters(),
+        list(model.parameters()) + list(arc_margin.parameters()) if (args.optimize_arc_margin_weights and args.use_arc_margin) else model.parameters(),
         lr=args.lr,
         betas=(args.beta_1, args.beta_2),
         eps=args.eps,
-        weight_decay=0.0005,
+        weight_decay=0.0005
     )
     
     if args.resume_optimizer:
         feat_optimizer.load_state_dict(torch.load(args.resume_optimizer, weights_only=True))
+        
+    if args.resume_center_loss_optimizer:
+        center_loss_optimizer.load_state_dict(torch.load(args.resume_center_loss_optimizer, weights_only=True))
     
     print(f"Training a {type(model).__name__} model for {args.num_epochs} epochs")
-    
-    if args.base_loss == "ce":
-        criterion = nn.CrossEntropyLoss()
-    else:
-        criterion = nn.BCELoss()
 
     prev_loss = 1e8
     # Main training loop
@@ -220,7 +263,8 @@ def train(args):
         epoch_bar = tqdm(train_loader, desc=f"Epoch [{epoch_num+1}/{args.num_epochs + start_epoch}]")
         train_accuracy, train_loss = [], []
         for iter_num, batch in enumerate(epoch_bar):
-            feat, _, labels = batch
+            feat, _, labels = batch # audio_sample, path, class_id
+            
             if args.is_segmented:
                 n_segments = feat.shape[1]
                 feat = feat.view(-1, args.sampling_rate) # [batch_size * num_segments, sampling_rate]
@@ -233,40 +277,78 @@ def train(args):
             feat = feat.transpose(1, 2).to(args.device)
             labels = labels.to(args.device)
 
-            mix_feat, y_a, y_b, lam = utils.mixup_data(
-                feat, labels, args.device, alpha=0.5
-            )
-
-            targets_a = torch.cat([labels, y_a])
-            targets_b = torch.cat([labels, y_b])
-            feat = torch.cat([feat, mix_feat], dim=0)
-
-            feats, feat_outputs = model(feat)
-            if args.base_loss == "bce":
-                feat_loss = criterion(feat_outputs, labels.unsqueeze(1).float())
-            else:
-                feat_loss = utils.regmix_criterion(
-                    criterion, feat_outputs, targets_a, targets_b, lam
+            if not (args.use_arc_margin or args.use_center_loss): # Not fit for ArcFace and CenterLoss
+                # Manifold Mixup - mixes the interpolates embeddings and labels to create a new input and label pairs. The lambda value is used to balance the contribution of the two pairs.
+                mix_feat, y_a, y_b, lam = utils.mixup_data( 
+                    feat, labels, args.device, alpha=0.5
                 )
 
-            score = F.softmax(feat_outputs, dim=1)  # [:, 0]
-            predicted_classes = np.argmax(score.detach().cpu().numpy(), axis=1)
-            correct_predictions = [
-                1 for k in range(len(labels)) if predicted_classes[k] == labels[k]
-            ]
-            train_accuracy.append(sum(correct_predictions) / len(labels) * 100)
-            train_loss.append(feat_loss.item())
+                targets_a = torch.cat([labels, y_a])
+                targets_b = torch.cat([labels, y_b])
+                feat = torch.cat([feat, mix_feat], dim=0)
+
+            # ---- Forward pass ----
+            feats, base_logits = model(feat) # feats - last hidden, base_logits - model output from linear
+            
+            # ---- Compute base loss (CE or BCE) ----
+            total_loss = 0
+            if args.use_arc_margin: # Use arc margin logits instaed
+                logits = arc_margin(feats, labels)
+                
+                # if args.base_loss == "bce":
+                #     loss_base = criterion(logits, labels.unsqueeze(1).float())
+                # else:
+                loss_base = criterion(logits, labels) # ArcMargin expects hard labels so no Mixup
+            
+            else: # use model original output
+                logits = base_logits
+                
+                # if args.base_loss == "bce":
+                #     loss_base = criterion(logits, labels.unsqueeze(1).float())
+                if not args.use_center_loss:
+                    loss_base = utils.regmix_criterion(
+                        criterion, logits, targets_a, targets_b, lam
+                    )
+                else:
+                    loss_base = criterion(logits, labels)
+                    
+            total_loss += loss_base
+                
+            # ---- Center loss ----
+            if args.use_center_loss:
+                loss_center = center_loss_fn(feats, labels) # Center loss expects hard labels so no Mixup
+                total_loss += args.center_loss_weight * loss_center
+
+            # ---- Backprop ----
+            feat_optimizer.zero_grad()
+            if args.use_center_loss:
+                center_loss_optimizer.zero_grad()
+                
+            total_loss.backward()
+            
+            feat_optimizer.step()
+            if args.use_center_loss:
+                # scale down center loss grads
+                for param in center_loss_fn.parameters():
+                    param.grad.data *= (1. / args.center_loss_weight)
+                center_loss_optimizer.step()
+            
+            # ---- Scores ----
+            with torch.no_grad():
+                score = F.softmax(logits, dim=1)  # [:, 0]
+                predicted = torch.argmax(score, dim=1)
+                acc = (predicted == labels).float().mean()
+
+            train_accuracy.append(acc.item())
+            train_loss.append(total_loss.item())
+            
             epoch_bar.set_postfix(
                 {
                     "train_loss": f"{sum(train_loss)/(iter_num+1):.4f}",
                     "acc": f"{sum(train_accuracy)/(iter_num+1):.2f}",
                 }
             )
-
-            feat_optimizer.zero_grad()
-            feat_loss.backward()
-            feat_optimizer.step()
-            
+   
         epoch_train_loss = sum(train_loss) / (iter_num + 1)
         epoch_train_acc = sum(train_accuracy) / (iter_num + 1)
 
@@ -289,21 +371,26 @@ def train(args):
                 feat = feat.transpose(1, 2).to(args.device)
                 labels = labels.to(args.device)
 
-                feats, feat_outputs = model(feat)
-                if args.base_loss == "bce":
-                    feat_loss = criterion(feat_outputs, labels.unsqueeze(1).float())
-                    score = feat_outputs
+                feats, base_logits = model(feat)
+                
+                if args.use_arc_margin:
+                    logits = arc_margin(feats, labels)
                 else:
-                    feat_loss = criterion(feat_outputs, labels)
-                    score = F.softmax(feat_outputs, dim=1)
-
-                predicted_classes = np.argmax(score.detach().cpu().numpy(), axis=1)
-                correct_predictions = [
-                    1 for k in range(len(labels)) if predicted_classes[k] == labels[k]
-                ]
-                val_accuracy.append(sum(correct_predictions) / len(labels) * 100)
-
-                val_loss.append(feat_loss.item())
+                    logits = base_logits
+                
+                # if args.base_loss == "bce":
+                #     loss = criterion(logits, labels.unsqueeze(1).float())
+                #     score = logits
+                # else:
+                loss = criterion(logits, labels)
+                score = F.softmax(logits, dim=1)
+                
+                predicted = torch.argmax(score, dim=1)
+                acc = (predicted == labels).float().mean()
+                
+                val_accuracy.append(acc.item())
+                val_loss.append(loss.item())
+                
                 val_bar.set_postfix(
                     {
                         "val_loss": f"{sum(val_loss)/(iter_num+1):.4f}",
@@ -325,6 +412,8 @@ def train(args):
             
             # Save optimizer state
             torch.save(feat_optimizer.state_dict(), os.path.join(args.out_folder, "optimizer.pth"))
+            if args.use_center_loss:
+                torch.save(center_loss_optimizer.state_dict(), os.path.join(args.out_folder, "center_loss_optimizer.pth"))
             
             # Save training stats
             with open(os.path.join(args.out_folder, "training_stats.json"), "w") as file:
@@ -350,6 +439,8 @@ def train(args):
             
             # Save optimizer state
             torch.save(feat_optimizer.state_dict(), os.path.join(args.out_folder, "checkpoint", "optimizer_%02d.pth" % (epoch_num + 1)))
+            if args.use_center_loss:
+                torch.save(center_loss_optimizer.state_dict(), os.path.join(args.out_folder, "checkpoint", "center_loss_optimizer_%02d.pth" % (epoch_num + 1)))
             
             # Save training stats just in case
             with open(os.path.join(args.out_folder, "checkpoint","training_stats_%02d.json" % (epoch_num + 1)), "w") as file:

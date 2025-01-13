@@ -133,3 +133,90 @@ class MLAADBaseDataset(Dataset):
                 wav = np.pad(wav, (0, max(0, target_length - wav.shape[0])), mode="wrap")
                 segments = [wav[i * segment_length : (i + 1) * segment_length] for i in range(self.n_segments)]
             return np.stack(segments)
+        
+class MLAADFD_AR_Dataset(Dataset):
+    def __init__(self, path_to_dataset, part="train", mode="train", segmented=False, max_samples=-1, emphasiser_args: dict={}):
+        super().__init__()
+        self.path_to_dataset = path_to_dataset
+        self.part = part
+        self.segmented = segmented
+        self.ptf = os.path.join(path_to_dataset, self.part)
+        self.all_files = librosa.util.find_files(self.ptf, ext="wav")
+        if mode == "known":
+            # keep only known classes seen during training for F1 metrics
+            self.all_files = [
+                x for x in self.all_files if int(os.path.basename(x).split("_")[1]) < 24
+            ]
+
+        if max_samples > 0:
+            self.all_files = self.all_files[:max_samples]
+
+        # Determine the set of labels
+        self.labels = sorted(
+            set([int(os.path.split(x)[1].split("_")[1]) for x in self.all_files])
+        )
+        
+        
+        # Add emphasized data to the dataset
+        if not emphasiser_args.pre_augmented:
+            self.list_of_emphases = ["original", "reverb", "speech", "music", "noise"]
+        else:
+            self.list_of_emphases = ["original"]
+        
+        self.emphasiser = WaveformEmphasiser(
+            emphasiser_args.sampling_rate, 
+            emphasiser_args.musan_path,
+            emphasiser_args.rir_path,
+            segmented=segmented
+        )
+        
+        self.all_files_emphasized = []
+        self.labels_emphasized = []
+        for filepath in self.all_files:
+            # Extend labels times number of emphases
+            basename = os.path.basename(filepath)
+            all_info = basename.split("_")
+            label = int(all_info[1])
+            self.labels_emphasized.extend([label]*len(self.list_of_emphases))
+            
+            # Extend files with emphasized versions
+            for emphasis in self.list_of_emphases:
+                self.all_files_emphasized.append((filepath, emphasis))
+                
+        self._print_info()
+
+    def _print_info(self):
+        print(f"Searching for samples in folder: {self.ptf}")
+        print(f"Found {len(self.all_files)} files...")
+        print(f"Applied {len(self.list_of_emphases)} emphases...")
+        print(f"Resulting in {len(self.all_files_emphasized)} samples...")
+        print(f"Using {len(self.labels)} classes\n")
+        print(
+            "Seen classes: ",
+            set([int(os.path.basename(x).split("_")[1]) for x in self.all_files]),
+        )
+        
+    def load_wav(self, file_path: str) -> np.ndarray:
+        if self.segmented:
+            audio, sr = librosa.load(file_path, sr=None, mono=False) # segments are stored as channels
+        else:
+            audio, sr = librosa.load(file_path, sr=None, mono=True)
+            audio = np.expand_dims(audio, axis=0)
+        if sr != self.emphasiser.sampling_rate:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=self.emphasiser.sampling_rate)
+        return audio
+
+    def __len__(self):
+        return len(self.all_files_emphasized)
+
+    def __getitem__(self, idx):
+        filepath, emphasis = self.all_files_emphasized[idx]
+        basename = os.path.basename(filepath)
+        all_info = basename.split("_")
+        waveform = self.load_wav(filepath)
+        feat = torch.from_numpy(waveform).float()
+        feat = self.emphasiser(feat, emphasis)
+        filename = "_".join(all_info[2:-1])
+        label = int(all_info[1])
+
+        return feat, filename, label
