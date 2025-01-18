@@ -15,7 +15,7 @@ from tqdm import tqdm
 from src import utils
 from src.datasets.dataset import MLAADFD_AR_Dataset
 from src.models.w2v2_aasist import W2VAASIST_AR
-from src.lossess import ArcMarginProduct, CenterLoss
+from src.lossess import ArcMarginProduct, SubcenterArcMarginProduct, CenterLoss
 
 
 def parse_args():
@@ -26,17 +26,17 @@ def parse_args():
         "-f",
         "--path_to_dataset",
         type=str,
-        default="./exp/prepared_ds/",
+        default="data/prepared_ds/",
         help="Path to the previuosly extracted features",
     )
     parser.add_argument(
         "--is_segmented",
         type=bool,
-        default=False,
+        default=True,
         help="If audio samples in dataset are split into segments",
     )
     parser.add_argument(
-        "--out_folder", type=str, default="./exp/trained_models/base", help="Output folder"
+        "--out_folder", type=str, default="exp/trained_models/base", help="Output folder"
     )
     
     # Augmentation parameters
@@ -112,8 +112,14 @@ def parse_args():
         "--base_loss",
         type=str,
         default="ce",
-        choices=["ce"], # "bce"
+        choices=["ce"],
         help="Loss for basic training",
+    )
+    parser.add_argument(
+        "--label_smoothing",
+        type=float,
+        default=0.0,
+        help="Label smoothing factor [0.0 - 1.0] for the loss function"
     )
     
     # Resume training
@@ -144,10 +150,13 @@ def parse_args():
             return value
     
     parser.add_argument("--use_arc_margin", action="store_true", help="Use ArcMarginProduct")
+    parser.add_argument("--use_sub-center-arc_margin", action="store_true", help="Use Sub-Center ArcMarginProduct")
+    
     parser.add_argument("--arc_s", type=float_or_str, default="auto", help="Scale parameter s for ArcMarginProduct")
-    parser.add_argument("--arc_m", type=float, default=0.05, help="Margin parameter m for ArcMarginProduct")
+    parser.add_argument("--arc_m", type=float, default=0.5, help="Margin parameter m for ArcMarginProduct")
     parser.add_argument("--easy_margin", type=bool, default=False, help="Use easy margin in ArcMarginProduct")
     parser.add_argument("--optimize_arc_margin_weights", type=bool, default=True, help="Optimize ArcMarginProduct weights")
+    parser.add_argument("--k_centers", type=int, default=1, help="Number of centers for Sub-Center ArcMarginProduct")
     
     parser.add_argument("--use_center_loss", action="store_true", help="Use CenterLoss")
     parser.add_argument("--center_loss_weight", type=float, default=0.01, help="Weight for CenterLoss")
@@ -182,9 +191,9 @@ def parse_args():
 def train(args):
     # Load the train and dev data (only known classes)
     print("Loading training data...")
-    training_set = MLAADFD_AR_Dataset(args.path_to_dataset, "train", segmented=args.is_segmented, emphasiser_args=args)
+    training_set = MLAADFD_AR_Dataset(args.path_to_dataset, args.pre_augmented, args.sampling_rate, args.musan_path, args.rir_path, "train", segmented=args.is_segmented)
     print("\nLoading dev data...")
-    dev_set = MLAADFD_AR_Dataset(args.path_to_dataset, "dev", mode="known", segmented=args.is_segmented, emphasiser_args=args)
+    dev_set = MLAADFD_AR_Dataset(args.path_to_dataset, args.pre_augmented, args.sampling_rate, args.musan_path, args.rir_path, "dev", mode="known", segmented=args.is_segmented)
 
     train_loader = DataLoader(
         training_set,
@@ -202,21 +211,34 @@ def train(args):
     )
     
     start_epoch = 0
-
-    # Setup the model to learn in-domain classess
-    model = W2VAASIST_AR(args.feat_dim, args.num_classes, extractor_args=args).to(args.device)
     
     # Set up loss functions
     if args.base_loss == "ce":
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(
+            label_smoothing=args.label_smoothing
+        )
     else:
-        criterion = nn.BCELoss()
+        raise ValueError(f"Loss function {args.base_loss} not supported")
+    
+    if args.use_arc_margin and args.use_sub_center_arc_margin:
+        raise ValueError("Cannot use both ArcMarginProduct and SubcenterArcMarginProduct at the same time")
         
     if args.use_arc_margin:
         print("[INFO] Using ArcFace Loss...")
         arc_margin = ArcMarginProduct(
             in_features=5 * 32, # Last hidden output size of W2VAASIST
             out_features=args.num_classes,
+            s=args.arc_s,
+            m=args.arc_m,
+            easy_margin=args.easy_margin
+        ).to(args.device)
+        
+    if args.use_sub_center_arc_margin:
+        print(f"[INFO] Using Sub-Center ArcFace Loss with {args.k_centers} centers per class...")
+        arc_margin = SubcenterArcMarginProduct(
+            in_features=5 * 32, # Last hidden output size of W2VAASIST
+            out_features=args.num_classes,
+            K=args.k_centers,
             s=args.arc_s,
             m=args.arc_m,
             easy_margin=args.easy_margin
@@ -230,6 +252,40 @@ def train(args):
             use_gpu=(args.device.type == "cuda")
         )
         center_loss_optimizer = torch.optim.SGD(center_loss_fn.parameters(), lr=0.5) # Separate optimizer for center-loss parameters
+        
+    # Setup the model to learn in-domain classess
+    if args.use_sub_center_arc_margin and args.k_centers > 1:
+        # Output should be K_centers * num_classes
+        model = W2VAASIST_AR(
+            feature_dim=args.feat_dim, 
+            num_labels=args.num_classes * args.k_centers, 
+            extractor_model_class=args.model_class, 
+            extractor_model_layer=args.model_layer, 
+            extractor_hugging_face_path=args.hugging_face_path, 
+            extractor_sampling_rate=args.sampling_rate,
+            normalize_before_output=True # ArcMargin expects normalized embeddings
+        ).to(args.device)
+        
+    elif args.use_arc_margin:
+        model = W2VAASIST_AR(
+            feature_dim=args.feat_dim, 
+            num_labels=args.num_classes, 
+            extractor_model_class=args.model_class, 
+            extractor_model_layer=args.model_layer, 
+            extractor_hugging_face_path=args.hugging_face_path, 
+            extractor_sampling_rate=args.sampling_rate,
+            normalize_before_output=True # ArcMargin expects normalized embeddings
+        ).to(args.device)
+        
+    else:
+        model = W2VAASIST_AR(
+            feature_dim=args.feat_dim, 
+            num_labels=args.num_classes, 
+            extractor_model_class=args.model_class, 
+            extractor_model_layer=args.model_layer, 
+            extractor_hugging_face_path=args.hugging_face_path, 
+            extractor_sampling_rate=args.sampling_rate
+        ).to(args.device)
     
     if args.resume_checkpoint and args.resume_epoch:
         print(f"Resuming training from checkpoint {args.resume_checkpoint} at epoch {args.resume_epoch}")
@@ -239,7 +295,7 @@ def train(args):
         
     # Main optimizer + arc_margin params (optional)
     feat_optimizer = torch.optim.Adam(
-        list(model.parameters()) + list(arc_margin.parameters()) if (args.optimize_arc_margin_weights and args.use_arc_margin) else model.parameters(),
+        list(model.parameters()) + list(arc_margin.parameters()) if (args.optimize_arc_margin_weights and (args.use_arc_margin or args.use_sub_center_arc_margin)) else model.parameters(),
         lr=args.lr,
         betas=(args.beta_1, args.beta_2),
         eps=args.eps,
@@ -277,7 +333,7 @@ def train(args):
             feat = feat.transpose(1, 2).to(args.device)
             labels = labels.to(args.device)
 
-            if not (args.use_arc_margin or args.use_center_loss): # Not fit for ArcFace and CenterLoss
+            if not (args.use_arc_margin or args.use_center_loss or args.use_sub_center_arc_margin): # Not fit for ArcFace and CenterLoss
                 # Manifold Mixup - mixes the interpolates embeddings and labels to create a new input and label pairs. The lambda value is used to balance the contribution of the two pairs.
                 mix_feat, y_a, y_b, lam = utils.mixup_data( 
                     feat, labels, args.device, alpha=0.5
@@ -292,19 +348,14 @@ def train(args):
             
             # ---- Compute base loss (CE or BCE) ----
             total_loss = 0
-            if args.use_arc_margin: # Use arc margin logits instaed
+            if args.use_arc_margin or args.use_sub_center_arc_margin: # Use arc margin logits instaed
                 logits = arc_margin(feats, labels)
                 
-                # if args.base_loss == "bce":
-                #     loss_base = criterion(logits, labels.unsqueeze(1).float())
-                # else:
                 loss_base = criterion(logits, labels) # ArcMargin expects hard labels so no Mixup
-            
+                
             else: # use model original output
                 logits = base_logits
                 
-                # if args.base_loss == "bce":
-                #     loss_base = criterion(logits, labels.unsqueeze(1).float())
                 if not args.use_center_loss:
                     loss_base = utils.regmix_criterion(
                         criterion, logits, targets_a, targets_b, lam
@@ -351,6 +402,11 @@ def train(args):
    
         epoch_train_loss = sum(train_loss) / (iter_num + 1)
         epoch_train_acc = sum(train_accuracy) / (iter_num + 1)
+        
+        if args.use_arc_margin or args.use_sub_center_arc_margin:
+            # Swap model's default linear weights with the ArcMarginProduct weights (as these are trained)
+            w_norm = F.normalize(arc_margin.weight.data, p=2, dim=1)
+            model.out_layer.weight.data.copy_(w_norm)
 
         # Epoch eval
         model.eval()
@@ -373,15 +429,20 @@ def train(args):
 
                 feats, base_logits = model(feat)
                 
-                if args.use_arc_margin:
-                    logits = arc_margin(feats, labels)
+                # Use model's default output layer - do not apply margin
+                if args.use_sub_center_arc_margin:
+                    # Aggregate sub-center outputs
+                    if arc_margin.K > 1:
+                        logits = torch.reshape(base_logits, (-1, arc_margin.out_features, arc_margin.K))
+                        logits, _ = torch.max(logits, axis=2)
+                        logits *= arc_margin.s # TODO: Check if this is correct
+                        
+                elif args.use_arc_margin:
+                    logits *= arc_margin.s # TODO: Check if this is correct
+                    
                 else:
                     logits = base_logits
                 
-                # if args.base_loss == "bce":
-                #     loss = criterion(logits, labels.unsqueeze(1).float())
-                #     score = logits
-                # else:
                 loss = criterion(logits, labels)
                 score = F.softmax(logits, dim=1)
                 
@@ -402,12 +463,22 @@ def train(args):
         epoch_val_acc = sum(val_accuracy) / (iter_num + 1)
         
         if epoch_val_loss < prev_loss:
+            state = model.state_dict()
+            
+            if args.use_arc_margin or args.use_sub_center_arc_margin:         
+                # Keep scale for inference
+                state["arc_margin_scale"] = arc_margin.s
+            
+            if args.use_sub_center_arc_margin:
+                # Keep K_centers for inference
+                state["arc_margin_k_centers"] = arc_margin.K
+            
             # Save the checkpoint with better val_loss
             checkpoint_path = os.path.join(
                 args.out_folder, "anti-spoofing_feat_model.pth"
             )
             print(f"[INFO] Saving model with better val_loss to {checkpoint_path}")
-            torch.save(model.state_dict(), checkpoint_path)
+            torch.save(state, checkpoint_path)
             prev_loss = epoch_val_loss
             
             # Save optimizer state
@@ -426,6 +497,16 @@ def train(args):
                 }))
 
         elif (epoch_num + 1) % 5 == 0:
+            chpt_state = model.state_dict()
+            
+            if args.use_arc_margin or args.use_sub_center_arc_margin:         
+                # Keep scale for inference
+                chpt_state["arc_margin_scale"] = arc_margin.s
+            
+            if args.use_sub_center_arc_margin:
+                # Keep K_centers for inference
+                chpt_state["arc_margin_k_centers"] = arc_margin.K
+                
             # Save the intermediate checkpoints just in case
             checkpoint_path = os.path.join(
                 args.out_folder,
@@ -435,7 +516,7 @@ def train(args):
             print(
                 f"[INFO] Saving intermediate model at epoch {epoch_num+1} to {checkpoint_path}"
             )
-            torch.save(model.state_dict(), checkpoint_path)
+            torch.save(chpt_state, checkpoint_path)
             
             # Save optimizer state
             torch.save(feat_optimizer.state_dict(), os.path.join(args.out_folder, "checkpoint", "optimizer_%02d.pth" % (epoch_num + 1)))

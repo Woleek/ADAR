@@ -135,7 +135,18 @@ class MLAADBaseDataset(Dataset):
             return np.stack(segments)
         
 class MLAADFD_AR_Dataset(Dataset):
-    def __init__(self, path_to_dataset, part="train", mode="train", segmented=False, max_samples=-1, emphasiser_args: dict={}):
+    def __init__(
+        self, 
+        path_to_dataset, 
+        empasizer_pre_augmented,
+        empasizer_sampling_rate,
+        empasizer_musan_path,
+        empasizer_rir_path,
+        part="train", 
+        mode="train", 
+        segmented=False, 
+        max_samples=-1,
+        ):
         super().__init__()
         self.path_to_dataset = path_to_dataset
         self.part = part
@@ -158,15 +169,15 @@ class MLAADFD_AR_Dataset(Dataset):
         
         
         # Add emphasized data to the dataset
-        if not emphasiser_args.pre_augmented:
+        if not empasizer_pre_augmented:
             self.list_of_emphases = ["original", "reverb", "speech", "music", "noise"]
         else:
             self.list_of_emphases = ["original"]
         
         self.emphasiser = WaveformEmphasiser(
-            emphasiser_args.sampling_rate, 
-            emphasiser_args.musan_path,
-            emphasiser_args.rir_path,
+            empasizer_sampling_rate, 
+            empasizer_musan_path,
+            empasizer_rir_path,
             segmented=segmented
         )
         

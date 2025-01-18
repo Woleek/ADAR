@@ -387,7 +387,7 @@ class Residual_block(nn.Module):
 
 
 class W2VAASIST(nn.Module):
-    def __init__(self, feature_dim, num_labels):
+    def __init__(self, feature_dim, num_labels, normalize_before_output=False):
         super().__init__()
         # AASIST parameters
         filts = [128, [1, 32], [32, 32], [32, 64], [64, 64]]
@@ -455,6 +455,7 @@ class W2VAASIST(nn.Module):
         self.pool_hS2 = GraphPool(pool_ratios[2], gat_dims[1], 0.3)
         self.pool_hT2 = GraphPool(pool_ratios[2], gat_dims[1], 0.3)
 
+        self.normalize_before_output = normalize_before_output # When using ArcMarginProduct
         self.out_layer = nn.Linear(5 * gat_dims[1], num_labels)
 
     def forward(self, x):
@@ -543,18 +544,31 @@ class W2VAASIST(nn.Module):
         S_avg = torch.mean(out_S, dim=1)
         last_hidden = torch.cat([T_max, T_avg, S_max, S_avg, master.squeeze(1)], dim=1)
         last_hidden = self.drop(last_hidden)
-        output = self.out_layer(last_hidden)
+        
+        if self.normalize_before_output:
+            last_hidden_norm = F.normalize(last_hidden, p=2, dim=1)
+        output = self.out_layer(last_hidden_norm)
+        
         return last_hidden, output
     
 class W2VAASIST_AR(W2VAASIST):
-    def __init__(self, feature_dim, num_labels, extractor_args: dict={}):
+    def __init__(
+        self, 
+        feature_dim, 
+        num_labels, 
+        extractor_model_class,
+        extractor_model_layer,
+        extractor_hugging_face_path,
+        extractor_sampling_rate,
+        normalize_before_output=False
+    ):
         self.feature_extractor = HuggingFaceFeatureExtractor(
-            model_class_name=extractor_args.model_class,
-            layer=extractor_args.model_layer,
-            name=extractor_args.hugging_face_path
+            model_class_name=extractor_model_class,
+            layer=extractor_model_layer,
+            name=extractor_hugging_face_path
         )
-        self.sampling_rate = extractor_args.sampling_rate
-        super().__init__(feature_dim, num_labels)
+        self.sampling_rate = extractor_sampling_rate
+        super().__init__(feature_dim, num_labels, normalize_before_output)
         
     def extract_features(self, x): # Extract features from waveform using the Wav2Vec2 model
         with torch.no_grad():
