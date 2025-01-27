@@ -7,91 +7,95 @@ import math
     
 # https://github.com/vladimirstarygin/Subcenter-ArcFace-Pytorch/blob/main/data_filtering/src/train_utils/losses/Subcenter_arcface.py
 class SubcenterArcMarginProduct(nn.Module):
-    def __init__(self, in_features, out_features, K=3, s=30.0, m=0.50, easy_margin=False):
+    def __init__(self, K=3, s=30.0, m=0.50, easy_margin=False):
         super(SubcenterArcMarginProduct, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
         self.K = K
-        self.s = s if s != "auto" else math.sqrt(2) * math.log(out_features - 1) # AdaCos paper recommendation
+        self.s = s
         self.m = m
-        self.weight = Parameter(torch.FloatTensor(out_features*self.K, in_features))
-        nn.init.xavier_uniform_(self.weight)
 
         self.easy_margin = easy_margin
         self.cos_m = math.cos(m)
         self.sin_m = math.sin(m)
         self.th = math.cos(math.pi - m)
         self.mm = math.sin(math.pi - m) * m
-
-    def forward(self, input, label):
-        # --------------------------- cos(theta) & phi(theta) ---------------------------
-        cosine = F.linear(F.normalize(input), F.normalize(self.weight))
         
+    def scale(self, logits):
+        n_classess = logits.size(1)
+        
+        if self.s == "auto":
+            return logits * math.sqrt(2) * math.log(n_classess - 1)
+        else:
+           return logits * self.s
+
+    def forward(self, cosine, label):
+        # Determine the number of classes
+        n_classess = cosine.size(1) // self.K
+        
+        # Aggregate from K subcenters
         if self.K > 1:
-            cosine = torch.reshape(cosine, (-1, self.out_features, self.K))
+            cosine = torch.reshape(cosine, (-1, n_classess, self.K))
             cosine, _ = torch.max(cosine, axis=2)
         
         sine = torch.sqrt((1.0 - torch.pow(cosine, 2)).clamp(0, 1))
-        #cos(phi+m)
+        
+        # Calculate phi - the angle between the logits and the target class
         phi = cosine * self.cos_m - sine * self.sin_m
 
+        # Apply the margin
         if self.easy_margin:
             phi = torch.where(cosine > 0, phi, cosine)
         else:
             phi = torch.where(cosine > self.th, phi, cosine - self.mm)
 
-        # --------------------------- convert label to one-hot ---------------------------
-        # one_hot = torch.zeros(cosine.size(), requires_grad=True, device='cuda')
-        one_hot = torch.zeros(cosine.size(), device='cuda')
+        # Convert label to one-hot
+        one_hot = torch.zeros(cosine.size(), device=cosine.device)
         one_hot.scatter_(1, label.view(-1, 1).long(), 1)
-        # -------------torch.where(out_i = {x_i if condition_i else y_i) -------------
+        
+        # Calculate the output logits
         output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
-        output *= self.s
+        
+        # Scale output
+        output = self.scale(output)
 
         return output
     
 # https://github.com/ronghuaiyang/arcface-pytorch/blob/47ace80b128042cd8d2efd408f55c5a3e156b032/models/metrics.py
 class ArcMarginProduct(nn.Module):
-    r"""Implement of large margin arc distance: :
-        Args:
-            in_features: size of each input sample
-            out_features: size of each output sample
-            s: norm of input feature
-            m: margin
-
-            cos(theta + m)
-        """
-    def __init__(self, in_features, out_features, s=30.0, m=0.50, easy_margin=False):
+    def __init__(self, s=30.0, m=0.50, easy_margin=False):
         super(ArcMarginProduct, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.s = s if s != "auto" else math.sqrt(2) * math.log(out_features - 1) # AdaCos paper recommendation
+        self.s = s
         self.m = m
-        self.weight = Parameter(torch.FloatTensor(out_features, in_features))
-        nn.init.xavier_uniform_(self.weight)
 
         self.easy_margin = easy_margin
         self.cos_m = math.cos(m)
         self.sin_m = math.sin(m)
         self.th = math.cos(math.pi - m)
         self.mm = math.sin(math.pi - m) * m
+        
+    def scale(self, logits):
+        n_classess = logits.size(1)
+        
+        if self.s == "auto":
+            return logits * math.sqrt(2) * math.log(n_classess - 1)
+        else:
+           return logits * self.s
 
-    def forward(self, input, label):
-        # --------------------------- cos(theta) & phi(theta) ---------------------------
-        cosine = F.linear(F.normalize(input), F.normalize(self.weight))
+    def forward(self, cosine, label):
         sine = torch.sqrt((1.0 - torch.pow(cosine, 2)).clamp(0, 1))
+        
         phi = cosine * self.cos_m - sine * self.sin_m
+        
         if self.easy_margin:
             phi = torch.where(cosine > 0, phi, cosine)
         else:
             phi = torch.where(cosine > self.th, phi, cosine - self.mm)
-        # --------------------------- convert label to one-hot ---------------------------
-        # one_hot = torch.zeros(cosine.size(), requires_grad=True, device='cuda')
-        one_hot = torch.zeros(cosine.size(), device=input.device)
+
+        one_hot = torch.zeros(cosine.size(), device=cosine.device)
         one_hot.scatter_(1, label.view(-1, 1).long(), 1)
-        # -------------torch.where(out_i = {x_i if condition_i else y_i) -------------
+
         output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
-        output *= self.s
+        
+        output = self.scale(output)
 
         return output
     
