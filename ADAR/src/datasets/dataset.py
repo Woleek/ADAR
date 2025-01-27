@@ -134,6 +134,71 @@ class MLAADBaseDataset(Dataset):
                 segments = [wav[i * segment_length : (i + 1) * segment_length] for i in range(self.n_segments)]
             return np.stack(segments)
         
+class MLAADFDDataset(Dataset):
+    def __init__(
+        self, 
+        path_to_features, 
+        part="train", 
+        mode="train", 
+        max_samples=-1,
+        superclass_mapping=None,
+    ):
+        super().__init__()
+        self.path_to_features = path_to_features
+        self.part = part
+        self.ptf = os.path.join(path_to_features, self.part)
+        self.all_files = librosa.util.find_files(self.ptf, ext="pt")
+        if mode == "known":
+            # keep only known classes seen during training for F1 metrics
+            self.all_files = [
+                x for x in self.all_files if int(os.path.basename(x).split("_")[1]) < 24
+            ]
+
+        if max_samples > 0:
+            self.all_files = self.all_files[:max_samples]
+
+        # Determine the set of labels
+        self.all_labels = [int(os.path.split(x)[1].split("_")[1]) for x in self.all_files]
+        self.labels = sorted(
+            set(self.all_labels)
+        )
+        self.superclass_mapping = superclass_mapping
+        
+        if self.part == "train":   
+            self._calculate_class_weights()
+        
+        self._print_info()
+
+    def _print_info(self):
+        print(f"Searching for features in folder: {self.ptf}")
+        print(f"Found {len(self.all_files)} files...")
+        print(f"Using {len(self.labels)} classes\n")
+        print(
+            "Seen classes: ",
+            set([int(os.path.basename(x).split("_")[1]) for x in self.all_files]),
+        )
+        
+    def _calculate_class_weights(self):
+        class_counts = {label: self.all_labels.count(label) for label in self.labels}
+        self.sample_weights = [1 / class_counts[y] for y in self.all_labels]
+
+    def __len__(self):
+        return len(self.all_files)
+
+    def __getitem__(self, idx):
+        filepath = self.all_files[idx]
+        basename = os.path.basename(filepath)
+        all_info = basename.split("_")
+
+        feature_tensor = torch.load(filepath, weights_only=True)
+        filename = "_".join(all_info[2:-1])
+        label = int(all_info[1])
+        if self.superclass_mapping is not None:
+            suplabel = self.superclass_mapping[label]
+            label = (suplabel, label)
+
+        return feature_tensor, filename, label
+        
 class MLAADFD_AR_Dataset(Dataset):
     def __init__(
         self, 
@@ -146,6 +211,7 @@ class MLAADFD_AR_Dataset(Dataset):
         mode="train", 
         segmented=False, 
         max_samples=-1,
+        superclass_mapping=None,
         ):
         super().__init__()
         self.path_to_dataset = path_to_dataset
@@ -166,6 +232,7 @@ class MLAADFD_AR_Dataset(Dataset):
         self.labels = sorted(
             set([int(os.path.split(x)[1].split("_")[1]) for x in self.all_files])
         )
+        self.superclass_mapping = superclass_mapping
         
         
         # Add emphasized data to the dataset
@@ -193,6 +260,9 @@ class MLAADFD_AR_Dataset(Dataset):
             # Extend files with emphasized versions
             for emphasis in self.list_of_emphases:
                 self.all_files_emphasized.append((filepath, emphasis))
+             
+        if self.part == "train":   
+            self._calculate_class_weights()
                 
         self._print_info()
 
@@ -206,6 +276,10 @@ class MLAADFD_AR_Dataset(Dataset):
             "Seen classes: ",
             set([int(os.path.basename(x).split("_")[1]) for x in self.all_files]),
         )
+        
+    def _calculate_class_weights(self):
+        class_counts = {label: self.labels_emphasized.count(label) for label in self.labels}
+        self.sample_weights = [1 / class_counts[y] for y in self.labels_emphasized]
         
     def load_wav(self, file_path: str) -> np.ndarray:
         if self.segmented:
@@ -229,5 +303,8 @@ class MLAADFD_AR_Dataset(Dataset):
         feat = self.emphasiser(feat, emphasis)
         filename = "_".join(all_info[2:-1])
         label = int(all_info[1])
+        if self.superclass_mapping is not None:
+            suplabel = self.superclass_mapping[label]
+            label = (suplabel, label)
 
         return feat, filename, label

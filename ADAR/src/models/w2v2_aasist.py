@@ -1,11 +1,10 @@
 # Adapted from https://github.com/piotrkawa/audio-deepfake-source-tracing
 
-from typing import Union
+from typing import Dict, List, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from src.datasets.utils import HuggingFaceFeatureExtractor
         
 class GraphAttentionLayer(nn.Module):
     def __init__(self, in_dim, out_dim, **kwargs):
@@ -386,12 +385,13 @@ class Residual_block(nn.Module):
         return out
 
 
-class W2VAASIST(nn.Module):
-    def __init__(self, feature_dim, num_labels, normalize_before_output=False):
+class W2VAASIST_Backbone(nn.Module):
+    def __init__(self, feature_dim):
         super().__init__()
         # AASIST parameters
         filts = [128, [1, 32], [32, 32], [32, 64], [64, 64]]
         gat_dims = [64, 32]
+        self.output_dim = 5 * gat_dims[1]
         pool_ratios = [0.5, 0.5, 0.5, 0.5]
         temperatures = [2.0, 2.0, 100.0, 100.0]
         ####
@@ -454,9 +454,6 @@ class W2VAASIST(nn.Module):
 
         self.pool_hS2 = GraphPool(pool_ratios[2], gat_dims[1], 0.3)
         self.pool_hT2 = GraphPool(pool_ratios[2], gat_dims[1], 0.3)
-
-        self.normalize_before_output = normalize_before_output # When using ArcMarginProduct
-        self.out_layer = nn.Linear(5 * gat_dims[1], num_labels)
 
     def forward(self, x):
 
@@ -544,37 +541,114 @@ class W2VAASIST(nn.Module):
         S_avg = torch.mean(out_S, dim=1)
         last_hidden = torch.cat([T_max, T_avg, S_max, S_avg, master.squeeze(1)], dim=1)
         last_hidden = self.drop(last_hidden)
+
+        return last_hidden
+    
+class W2VAASIST(nn.Module):
+    def __init__(self, feature_dim: int, num_labels: int, normalize_before_output=False):
+        super().__init__()
+        self.backbone = W2VAASIST_Backbone(feature_dim)
+        
+        self.normalize_before_output = normalize_before_output # When using ArcMarginProduct
+        self.out_layer = nn.Linear(self.backbone.output_dim, num_labels, bias=False)
+        nn.init.xavier_uniform_(self.out_layer.weight)
+        
+    def forward(self, x):
+        last_hidden = self.backbone(x)
         
         if self.normalize_before_output:
-            last_hidden_norm = F.normalize(last_hidden, p=2, dim=1)
-        output = self.out_layer(last_hidden_norm)
+            last_hidden = F.normalize(last_hidden, p=2, dim=1)
+            weight = F.normalize(self.out_layer.weight, p=2, dim=1)
+            logits = F.linear(last_hidden, weight)
+            
+        else:
+            logits = self.out_layer(last_hidden)
+            
+        output = logits
         
         return last_hidden, output
-    
-class W2VAASIST_AR(W2VAASIST):
-    def __init__(
-        self, 
-        feature_dim, 
-        num_labels, 
-        extractor_model_class,
-        extractor_model_layer,
-        extractor_hugging_face_path,
-        extractor_sampling_rate,
-        normalize_before_output=False
-    ):
-        self.feature_extractor = HuggingFaceFeatureExtractor(
-            model_class_name=extractor_model_class,
-            layer=extractor_model_layer,
-            name=extractor_hugging_face_path
-        )
-        self.sampling_rate = extractor_sampling_rate
-        super().__init__(feature_dim, num_labels, normalize_before_output)
         
-    def extract_features(self, x): # Extract features from waveform using the Wav2Vec2 model
-        with torch.no_grad():
-            x = self.feature_extractor(x, self.sampling_rate)
-        return x.float()
+# class W2VAASIST_HCas(nn.Module): # Hierarchical Cascade
+#     def __init__(self, feature_dim: int, label_hierarchy: Dict[int, List[int]], normalize_before_output=False):
+#         super().__init__()
+#         self.backbone = W2VAASIST_Backbone(feature_dim)
+        
+#         self.normalize_before_output = normalize_before_output # When using ArcMarginProduct
+        
+#         self._prepare_labels(label_hierarchy)
+        
+#         # STAGE 1: One head for the superclass prediction
+#         self.out_layer_sup = nn.Linear(self.backbone.output_dim, self.num_suplabels)
+        
+#         # STAGE 2: One head for each subclass prediction
+#         self.out_layers_sub = nn.ModuleList([
+#             nn.Linear(self.backbone.output_dim, num_sublabels, bias=False)
+#             for num_sublabels in self.num_sublabels_per_sup
+#         ])
+        
+#     def _prepare_labels(self, label_hierarchy: Dict[int, List[int]]):
+#         self.num_suplabels = len(label_hierarchy)
+#         self.num_sublabels_per_sup = []
+        
+#         self.reverse_sub_mapping = {}
+#         self.global_sub_mapping = {}
+#         for suplabel, sublabels in label_hierarchy.items(): # sup ID, [global IDs]
+#             self.num_sublabels_per_sup.append(len(sublabels))
+            
+#             for idx, global_label in enumerate(sublabels): # local sub ID, sub ID
+#                 self.reverse_sub_mapping[(suplabel, idx)] = global_label # (sup ID, local sub ID) -> global ID
+#                 self.global_sub_mapping[global_label] = idx # global ID -> local sub ID
+                
+#     def get_original_label(self, supclass: int, subclass: int):
+#         return self.reverse_sub_mapping[(supclass, subclass)]
     
-    def train(self, mode=True):
-        super().train(mode)  # Call the original train method
-        self.feature_extractor.model.eval() # Ensure Wav2Vec stays in eval mode
+#     def get_local_label(self, global_label: int):
+#         return self.global_sub_mapping[global_label]
+        
+#     def forward(self, x):
+#         last_hidden = self.backbone(x)
+        
+#         if self.normalize_before_output:
+#             last_hidden = F.normalize(last_hidden, p=2, dim=1)
+            
+#         output_sup = self.out_layer_sup(last_hidden)
+        
+#         sub_outputs = [] #TODO: Check if passing through all sublabel heads is necessary
+#         for s, layer_sub in enumerate(self.out_layers_sub):
+#             sub_outputs.append(layer_sub(last_hidden))
+            
+#         output = (output_sup, sub_outputs)            
+        
+#         return last_hidden, output
+        
+    
+class W2VAASIST_HMulT(nn.Module): # Multi-Task
+    def __init__(self, feature_dim: int, num_suplabels: int, num_labels: int, normalize_before_output=False):
+        super().__init__()
+        self.backbone = W2VAASIST_Backbone(feature_dim)
+        
+        self.normalize_before_output = normalize_before_output # When using ArcMarginProduct
+        
+        self.sup_layer = nn.Linear(self.backbone.output_dim, num_suplabels, bias=False)
+        nn.init.xavier_uniform_(self.sup_layer.weight)
+        self.sub_layer = nn.Linear(self.backbone.output_dim, num_labels, bias=False)
+        nn.init.xavier_uniform_(self.sub_layer.weight)
+        
+    def forward(self, x):
+        last_hidden = self.backbone(x)
+        
+        if self.normalize_before_output:
+            last_hidden = F.normalize(last_hidden, p=2, dim=1)
+            sup_weight = F.normalize(self.sup_layer.weight, p=2, dim=1)
+            sub_weight = F.normalize(self.sub_layer.weight, p=2, dim=1)
+            
+            sup_logits = F.linear(last_hidden, sup_weight)
+            sub_logits = F.linear(last_hidden, sub_weight)
+            
+        else:
+            sup_logits = self.sup_layer(last_hidden)
+            sub_logits = self.sub_layer(last_hidden)
+        
+        output = (sup_logits, sub_logits)
+        
+        return last_hidden, output

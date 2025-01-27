@@ -5,6 +5,8 @@ import os
 import sys
 from pathlib import Path
 
+import torch
+
 # Enables running the script from root directory
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import pandas as pd
@@ -14,7 +16,7 @@ from tqdm import tqdm
 import soundfile
 
 from src.datasets.dataset import MLAADBaseDataset
-from src.datasets.utils import WaveformEmphasiser
+from src.datasets.utils import WaveformEmphasiser, HuggingFaceFeatureExtractor 
 
 
 def parse_args():
@@ -64,10 +66,33 @@ def parse_args():
         default="data/rirs/",
         help="Path to RIRs dataset",
     )
+    
+    # Encode
+    parser.add_argument(
+        "--encode", action="store_true", help="Encode samples with Wav2Vec2"
+    )
+    parser.add_argument(
+        "--model_class",
+        type=str,
+        default="Wav2Vec2Model",
+        help="Class of the feature extractor",
+    )
+    parser.add_argument(
+        "--model_layer",
+        type=int,
+        default=5,
+        help="Which layer to use from the feature extractor",
+    )
+    parser.add_argument(
+        "--hugging_face_path",
+        type=str,
+        default="facebook/wav2vec2-base",
+        help="Path from the HF collections",
+    )
 
     # Output folder
     parser.add_argument(
-        "--out_folder", type=str, default="exp/prepared_ds", help="Where to write the results"
+        "--out_folder", type=str, default="data/prepared_ds", help="Where to write the results"
     )
     args = parser.parse_args()
     if not os.path.exists(args.out_folder):
@@ -163,6 +188,15 @@ def main(args):
         shuffle=False,
         num_workers=args.num_workers,
     )
+    
+    feature_extractor = HuggingFaceFeatureExtractor(
+        model_class_name=args.model_class,
+        layer=args.model_layer,
+        name=args.hugging_face_path,
+    )
+    
+    feature_extractor.model.to('cuda')
+    feature_extractor.model.eval()
 
     ## Run the augmentation
     if args.augment:
@@ -171,7 +205,8 @@ def main(args):
     else:
         list_of_emphases = ["original"]
     for subset_, loader in zip(
-        ["train", "dev", "eval"], [train_loader, dev_loader, test_loader]
+        # ["train", "dev", "eval"], [train_loader, dev_loader, test_loader]
+        ["train", "dev"], [train_loader, dev_loader]
     ):
         count = 0
         dataset_folder = args.out_folder
@@ -189,22 +224,42 @@ def main(args):
             for emphasis in list_of_emphases:
                 if args.augment:
                     waveform = emphasiser(waveform, emphasis)
+                    
+                if args.encode:
+                    waveform = waveform.to("cuda")
+                    
+                    if args.n_segments > 1:
+                        n_segments = waveform.shape[2]
+                        waveform = waveform.view(-1, args.sampling_rate)
+                    
+                    feat = feature_extractor(waveform, args.sampling_rate)
+                    
+                    if args.n_segments > 1:
+                        feat = feat.view(-1, n_segments, *feat.shape[1:])
+                        feat = feat.mean(dim=1)
+                    
+                    feat = feat.detach().cpu()
 
                 # Create a unique filename which also includes the class id
                 # i.e. 000001_class_emphasisType_originalFileName.pt
                 orig_file_name = os.path.splitext(os.path.split(file_name[0])[1])[0]
                 for idx in range(batch_size): # handle batched data
-                    out_file_name = (
-                        f"{count:06d}_{label[idx].item()}_{emphasis}_{orig_file_name}.wav"
-                    )   
-                    
-                    wav = waveform[idx] if batch_size > 1 else waveform
-                    if args.n_segments is not None:
-                        wav = wav.squeeze().numpy().transpose(1, 0)
-                    else:
-                        wav = wav.squeeze().numpy()
+                    if not args.encode:
+                        out_file_name = (
+                            f"{count:06d}_{label[idx].item()}_{emphasis}_{orig_file_name}.wav"
+                        )  
+                        wav = waveform[idx] if batch_size > 1 else waveform
+                        if args.n_segments is not None:
+                            wav = wav.squeeze().numpy().transpose(1, 0)
+                        else:
+                            wav = wav.squeeze().numpy()
 
-                    soundfile.write(os.path.join(target_dir, out_file_name), wav, args.sampling_rate)
+                        soundfile.write(os.path.join(target_dir, out_file_name), wav, args.sampling_rate)
+                    else:
+                        out_file_name = (
+                            f"{count:06d}_{label[idx].item()}_{emphasis}_{orig_file_name}.pt"
+                        )  
+                        torch.save(feat[idx].float(), os.path.join(target_dir, out_file_name))
                     count += 1
                     iterator.update(1)
     print("[INFO] Augmentation step finished")
