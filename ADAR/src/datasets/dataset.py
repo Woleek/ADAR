@@ -158,6 +158,7 @@ class MLAADFDDataset(Dataset):
             self.all_files = self.all_files[:max_samples]
 
         # Determine the set of labels
+        # e.g. "someprefix_<GLOBAL_LABEL>_anything.pt"
         self.all_labels = [int(os.path.split(x)[1].split("_")[1]) for x in self.all_files]
         self.labels = sorted(
             set(self.all_labels)
@@ -170,17 +171,39 @@ class MLAADFDDataset(Dataset):
         self._print_info()
 
     def _print_info(self):
-        print(f"Searching for features in folder: {self.ptf}")
-        print(f"Found {len(self.all_files)} files...")
-        print(f"Using {len(self.labels)} classes\n")
+        print(f"Directory: {self.ptf}")
+        print(f"Found {len(self.all_files)} samples...")
+        if self.superclass_mapping is not None:
+            unique_sup = set(self.superclass_mapping.values())
+            print(f"Using {len(self.labels)} global classes with {len(unique_sup)} superclasses\n")
+        else:
+            print(f"Using {len(self.labels)} classes\n")
         print(
             "Seen classes: ",
             set([int(os.path.basename(x).split("_")[1]) for x in self.all_files]),
         )
         
     def _calculate_class_weights(self):
-        class_counts = {label: self.all_labels.count(label) for label in self.labels}
-        self.sample_weights = [1 / class_counts[y] for y in self.all_labels]
+        if self.superclass_mapping is None:
+            # Purely subclass-based weighting
+            class_counts = {label: self.all_labels.count(label) for label in self.labels}
+            self.sample_weights = [1.0 / class_counts[y] for y in self.all_labels]
+        else:
+            # Count samples for each global label
+            subclass_counts = {label: self.all_labels.count(label) for label in self.labels}
+            
+            # Count samples for each superclass
+            all_super_labels = [self.superclass_mapping[label] for label in self.all_labels]
+            super_labels = sorted(set(all_super_labels))
+            superclass_counts = {sup: all_super_labels.count(sup) for sup in super_labels}
+            
+            # Calculate weights with alpha
+            alpha = 0.5
+            self.sample_weights = [
+                alpha * (1.0 / subclass_counts[label]) +
+                (1 - alpha) * (1.0 / superclass_counts[self.superclass_mapping[label]])
+                for label in self.all_labels
+            ]
 
     def __len__(self):
         return len(self.all_files)
@@ -229,9 +252,12 @@ class MLAADFD_AR_Dataset(Dataset):
             self.all_files = self.all_files[:max_samples]
 
         # Determine the set of labels
+        # e.g. "someprefix_<GLOBAL_LABEL>_anything.wav"
+        self.all_labels = [int(os.path.split(x)[1].split("_")[1]) for x in self.all_files]
         self.labels = sorted(
-            set([int(os.path.split(x)[1].split("_")[1]) for x in self.all_files])
+            set(self.labels)
         )
+            
         self.superclass_mapping = superclass_mapping
         
         
@@ -267,19 +293,41 @@ class MLAADFD_AR_Dataset(Dataset):
         self._print_info()
 
     def _print_info(self):
-        print(f"Searching for samples in folder: {self.ptf}")
-        print(f"Found {len(self.all_files)} files...")
+        print(f"Directory: {self.ptf}")
+        print(f"Found {len(self.all_files)} samples...")
         print(f"Applied {len(self.list_of_emphases)} emphases...")
         print(f"Resulting in {len(self.all_files_emphasized)} samples...")
-        print(f"Using {len(self.labels)} classes\n")
+        if self.superclass_mapping is not None:
+            unique_sup = set(self.superclass_mapping.values())
+            print(f"Using {len(self.labels)} global classes with {len(unique_sup)} superclasses\n")
+        else:
+            print(f"Using {len(self.labels)} classes\n")
         print(
             "Seen classes: ",
             set([int(os.path.basename(x).split("_")[1]) for x in self.all_files]),
         )
         
     def _calculate_class_weights(self):
-        class_counts = {label: self.labels_emphasized.count(label) for label in self.labels}
-        self.sample_weights = [1 / class_counts[y] for y in self.labels_emphasized]
+        if self.superclass_mapping is None:
+            # Purely subclass-based weighting
+            class_counts = {label: self.all_labels.count(label) for label in self.labels}
+            self.sample_weights = [1.0 / class_counts[y] for y in self.all_labels]
+        else:
+            # Count samples for each global label
+            subclass_counts = {label: self.all_labels.count(label) for label in self.labels}
+            
+            # Count samples for each superclass
+            all_super_labels = [self.superclass_mapping[label] for label in self.all_labels]
+            super_labels = sorted(set(all_super_labels))
+            superclass_counts = {sup: all_super_labels.count(sup) for sup in super_labels}
+            
+            # Calculate weights with alpha
+            alpha = 0.5
+            self.sample_weights = [
+                alpha * (1.0 / subclass_counts[label]) +
+                (1 - alpha) * (1.0 / superclass_counts[self.superclass_mapping[label]])
+                for label in self.all_labels
+            ]
         
     def load_wav(self, file_path: str) -> np.ndarray:
         if self.segmented:

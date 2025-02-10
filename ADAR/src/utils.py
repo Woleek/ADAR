@@ -32,12 +32,14 @@ def load_superclass_mapping(dataset_path, superclass_mapping_path):
             
     # Count unique superclasses
     num_sup = len(set(id_map.values()))
+    next_new_id = num_sup - 1
     
-    # set -1 (Other) suplabel ID as the last class ID (ex. 0, 1, 2, -1 -> 0, 1, 2, 3)
+    # assign new superclass IDs to models labeled with -1 (unknown superclass)
     for sub, sup in id_map.items():
         if sup == -1:
-            id_map[sub] = num_sup - 1
-    
+            id_map[sub] = next_new_id
+            next_new_id += 1
+        
     return id_map, name_map
 
 

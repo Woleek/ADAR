@@ -1,6 +1,6 @@
 # Adapted from https://github.com/piotrkawa/audio-deepfake-source-tracing
 
-from typing import Dict, List, Union
+from typing import Dict, List, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -557,9 +557,9 @@ class W2VAASIST(nn.Module):
         last_hidden = self.backbone(x)
         
         if self.normalize_before_output:
-            last_hidden = F.normalize(last_hidden, p=2, dim=1)
+            last_hidden_norm = F.normalize(last_hidden, p=2, dim=1)
             weight = F.normalize(self.out_layer.weight, p=2, dim=1)
-            logits = F.linear(last_hidden, weight)
+            logits = F.linear(last_hidden_norm, weight)
             
         else:
             logits = self.out_layer(last_hidden)
@@ -568,61 +568,121 @@ class W2VAASIST(nn.Module):
         
         return last_hidden, output
         
-# class W2VAASIST_HCas(nn.Module): # Hierarchical Cascade
-#     def __init__(self, feature_dim: int, label_hierarchy: Dict[int, List[int]], normalize_before_output=False):
-#         super().__init__()
-#         self.backbone = W2VAASIST_Backbone(feature_dim)
+class W2VAASIST_LCPN(nn.Module): # Local Classifier per Parent Node
+    def __init__(self, feature_dim: int, label_mapping: Dict[int, int], normalize_before_output=False):
+        super().__init__()
+        self.backbone = W2VAASIST_Backbone(feature_dim)
         
-#         self.normalize_before_output = normalize_before_output # When using ArcMarginProduct
+        self.normalize_before_output = normalize_before_output # When using ArcMarginProduct
         
-#         self._prepare_labels(label_hierarchy)
+        self._prepare_labels(label_mapping)
         
-#         # STAGE 1: One head for the superclass prediction
-#         self.out_layer_sup = nn.Linear(self.backbone.output_dim, self.num_suplabels)
+        # STAGE 1: One head for the superclass prediction
+        self.sup_layer = nn.Linear(self.backbone.output_dim, len(self.label_hierarchy), bias=False)
         
-#         # STAGE 2: One head for each subclass prediction
-#         self.out_layers_sub = nn.ModuleList([
-#             nn.Linear(self.backbone.output_dim, num_sublabels, bias=False)
-#             for num_sublabels in self.num_sublabels_per_sup
-#         ])
+        # STAGE 2: One head for each superclass's sublabel prediction (with > 1 sublabels)
+        self.sub_layers = nn.ModuleDict({
+            str(suplabel): nn.Linear(self.backbone.output_dim, len(sublabels), bias=False) 
+            for suplabel, sublabels in self.label_hierarchy.items()
+            if len(sublabels) > 1
+        })
         
-#     def _prepare_labels(self, label_hierarchy: Dict[int, List[int]]):
-#         self.num_suplabels = len(label_hierarchy)
-#         self.num_sublabels_per_sup = []
-        
-#         self.reverse_sub_mapping = {}
-#         self.global_sub_mapping = {}
-#         for suplabel, sublabels in label_hierarchy.items(): # sup ID, [global IDs]
-#             self.num_sublabels_per_sup.append(len(sublabels))
-            
-#             for idx, global_label in enumerate(sublabels): # local sub ID, sub ID
-#                 self.reverse_sub_mapping[(suplabel, idx)] = global_label # (sup ID, local sub ID) -> global ID
-#                 self.global_sub_mapping[global_label] = idx # global ID -> local sub ID
+    def _build_label_hierarchy(self, label_mapping: Dict[int, int]) -> None:
+        # Build a hierarchy of labels based on global:superclass mapping
+        label_hierarchy = {}
+        for global_label, sup_label in label_mapping.items():
+            if sup_label not in label_hierarchy:
+                label_hierarchy[sup_label] = []
+            label_hierarchy[sup_label].append(global_label)
                 
-#     def get_original_label(self, supclass: int, subclass: int):
-#         return self.reverse_sub_mapping[(supclass, subclass)]
-    
-#     def get_local_label(self, global_label: int):
-#         return self.global_sub_mapping[global_label]
+        self.label_hierarchy = label_hierarchy # sup ID -> [global IDs]
+        # e.g., {0: [0,1], 1: [2,3], 2: [4]} 
+                   
+    def _prepare_labels(self, label_mapping: Dict[int, int]) -> None:
+        self._build_label_hierarchy(label_mapping)
+        self.max_sublabels = max(len(sublabels) for sublabels in self.label_hierarchy.values())
         
-#     def forward(self, x):
-#         last_hidden = self.backbone(x)
-        
-#         if self.normalize_before_output:
-#             last_hidden = F.normalize(last_hidden, p=2, dim=1)
+        self.global_mapping = {}
+        self.local_mapping = {}
+        for suplabel, sublabels in self.label_hierarchy.items():
             
-#         output_sup = self.out_layer_sup(last_hidden)
-        
-#         sub_outputs = [] #TODO: Check if passing through all sublabel heads is necessary
-#         for s, layer_sub in enumerate(self.out_layers_sub):
-#             sub_outputs.append(layer_sub(last_hidden))
-            
-#         output = (output_sup, sub_outputs)            
-        
-#         return last_hidden, output
-        
+            for idx, global_label in enumerate(sublabels): # local sub ID, sub ID
+                self.global_mapping[(suplabel, idx)] = global_label # (sup ID, local sub ID) -> global ID
+                self.local_mapping[global_label] = (suplabel, idx) # global ID -> (sup ID, local sub ID)
+                
+    def get_global_label(self, supclass: int, subclass: int) -> int:
+        # Returns the global label for a given superclass and subclass
+        return self.global_mapping[(supclass, subclass)]
     
-class W2VAASIST_HMulT(nn.Module): # Multi-Task
+    def get_local_label(self, global_label: int) -> Tuple[int, int]:
+        # Returns the superclass and subclass for a given global label
+        return self.local_mapping[global_label]
+    
+    def forward_backbone(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x)
+    
+    def classify_supclass(self, embedding: torch.Tensor) -> torch.Tensor:
+        if self.normalize_before_output:
+            embedding_norm = F.normalize(embedding, p=2, dim=1)
+            sup_weight = F.normalize(self.sup_layer.weight, p=2, dim=1)    
+            sup_logits = F.linear(embedding_norm, sup_weight)
+        else:
+            sup_logits = self.sup_layer(embedding)
+            
+        return sup_logits
+    
+    def classify_subclass(self, embedding: torch.Tensor, supclass: int) -> torch.Tensor:
+        sub_logits = torch.full(
+            size=(embedding.size(0), self.max_sublabels),
+            fill_value=float('-inf'),
+            device=embedding.device
+        )
+        
+        sup_id = str(supclass)
+        if sup_id not in self.sub_layers: # No classifier for this superclass
+            sub_logits[:, 0].fill_(1)
+            return sub_logits
+        
+        if self.normalize_before_output:
+            embedding_norm = F.normalize(embedding, p=2, dim=1)
+            sub_weight = F.normalize(self.sub_layers[sup_id].weight, p=2, dim=1)
+            logits = F.linear(embedding_norm, sub_weight)
+        else:
+            logits = self.sub_layers[sup_id](embedding)
+            
+        num_sublabels = logits.size(1)
+        sub_logits[:, :num_sublabels] = logits
+            
+        return sub_logits
+    
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        last_hidden = self.backbone(x)
+        
+        # STAGE 1: Predict superclass
+        sup_logits = self.classify_supclass(last_hidden)
+        sup_preds = sup_logits.argmax(dim=1)
+        
+        # STAGE 2: Predict sublabels for superclasses with > 1 sublabels
+        # Padded tensor for sublabel logits
+        sub_logits = torch.zeros((x.size(0), self.max_sublabels), device=x.device)
+        for sup_label in sup_preds.unique():
+            
+            # Get indices of samples with the current superclass
+            mask = (sup_preds == sup_label)
+            if mask.sum() == 0:
+                continue
+            
+            # Select corresponding embeddings
+            embeddings_subset = last_hidden[mask]
+            
+            # Predict sublabels
+            logits = self.classify_subclass(embeddings_subset, int(sup_label))
+            sub_logits[mask] = logits
+            
+        output = (sup_logits, sub_logits)
+        return last_hidden, output
+    
+class W2VAASIST_LCL(nn.Module): # Local Classifier per Level
     def __init__(self, feature_dim: int, num_suplabels: int, num_labels: int, normalize_before_output=False):
         super().__init__()
         self.backbone = W2VAASIST_Backbone(feature_dim)
@@ -638,12 +698,12 @@ class W2VAASIST_HMulT(nn.Module): # Multi-Task
         last_hidden = self.backbone(x)
         
         if self.normalize_before_output:
-            last_hidden = F.normalize(last_hidden, p=2, dim=1)
+            last_hidden_norm = F.normalize(last_hidden, p=2, dim=1)
             sup_weight = F.normalize(self.sup_layer.weight, p=2, dim=1)
             sub_weight = F.normalize(self.sub_layer.weight, p=2, dim=1)
             
-            sup_logits = F.linear(last_hidden, sup_weight)
-            sub_logits = F.linear(last_hidden, sub_weight)
+            sup_logits = F.linear(last_hidden_norm, sup_weight)
+            sub_logits = F.linear(last_hidden_norm, sub_weight)
             
         else:
             sup_logits = self.sup_layer(last_hidden)
