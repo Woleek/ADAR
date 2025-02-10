@@ -5,18 +5,28 @@ from typing import Dict, List, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+class LinearXavier(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super(LinearXavier, self).__init__(in_features, out_features, bias)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.weight)
+        if self.bias is not None:
+            nn.init.constant_(self.bias, 0.01)
         
 class GraphAttentionLayer(nn.Module):
     def __init__(self, in_dim, out_dim, **kwargs):
         super().__init__()
 
         # attention map
-        self.att_proj = nn.Linear(in_dim, out_dim)
+        self.att_proj = LinearXavier(in_dim, out_dim)
         self.att_weight = self._init_new_params(out_dim, 1)
 
         # project
-        self.proj_with_att = nn.Linear(in_dim, out_dim)
-        self.proj_without_att = nn.Linear(in_dim, out_dim)
+        self.proj_with_att = LinearXavier(in_dim, out_dim)
+        self.proj_without_att = LinearXavier(in_dim, out_dim)
 
         # batch norm
         self.bn = nn.BatchNorm1d(out_dim)
@@ -107,12 +117,12 @@ class HtrgGraphAttentionLayer(nn.Module):
     def __init__(self, in_dim, out_dim, **kwargs):
         super().__init__()
 
-        self.proj_type1 = nn.Linear(in_dim, in_dim)
-        self.proj_type2 = nn.Linear(in_dim, in_dim)
+        self.proj_type1 = LinearXavier(in_dim, in_dim)
+        self.proj_type2 = LinearXavier(in_dim, in_dim)
 
         # attention map
-        self.att_proj = nn.Linear(in_dim, out_dim)
-        self.att_projM = nn.Linear(in_dim, out_dim)
+        self.att_proj = LinearXavier(in_dim, out_dim)
+        self.att_projM = LinearXavier(in_dim, out_dim)
 
         self.att_weight11 = self._init_new_params(out_dim, 1)
         self.att_weight22 = self._init_new_params(out_dim, 1)
@@ -120,11 +130,11 @@ class HtrgGraphAttentionLayer(nn.Module):
         self.att_weightM = self._init_new_params(out_dim, 1)
 
         # project
-        self.proj_with_att = nn.Linear(in_dim, out_dim)
-        self.proj_without_att = nn.Linear(in_dim, out_dim)
+        self.proj_with_att = LinearXavier(in_dim, out_dim)
+        self.proj_without_att = LinearXavier(in_dim, out_dim)
 
-        self.proj_with_attM = nn.Linear(in_dim, out_dim)
-        self.proj_without_attM = nn.Linear(in_dim, out_dim)
+        self.proj_with_attM = LinearXavier(in_dim, out_dim)
+        self.proj_without_attM = LinearXavier(in_dim, out_dim)
 
         # batch norm
         self.bn = nn.BatchNorm1d(out_dim)
@@ -287,7 +297,7 @@ class GraphPool(nn.Module):
         super().__init__()
         self.k = k
         self.sigmoid = nn.Sigmoid()
-        self.proj = nn.Linear(in_dim, 1)
+        self.proj = LinearXavier(in_dim, 1)
         self.drop = nn.Dropout(p=p) if p > 0 else nn.Identity()
         self.in_dim = in_dim
 
@@ -412,7 +422,7 @@ class W2VAASIST_Backbone(nn.Module):
             nn.Sequential(Residual_block(nb_filts=filts[4])),
             nn.Sequential(Residual_block(nb_filts=filts[4])),
         )
-        self.LL = nn.Linear(feature_dim, 128)
+        self.LL = LinearXavier(feature_dim, 128)
 
         self.attention = nn.Sequential(
             nn.Conv2d(64, 128, kernel_size=(1, 1)),
@@ -550,8 +560,7 @@ class W2VAASIST(nn.Module):
         self.backbone = W2VAASIST_Backbone(feature_dim)
         
         self.normalize_before_output = normalize_before_output # When using ArcMarginProduct
-        self.out_layer = nn.Linear(self.backbone.output_dim, num_labels, bias=False)
-        nn.init.xavier_uniform_(self.out_layer.weight)
+        self.out_layer = LinearXavier(self.backbone.output_dim, num_labels, bias=False)
         
     def forward(self, x):
         last_hidden = self.backbone(x)
@@ -578,11 +587,11 @@ class W2VAASIST_LCPN(nn.Module): # Local Classifier per Parent Node
         self._prepare_labels(label_mapping)
         
         # STAGE 1: One head for the superclass prediction
-        self.sup_layer = nn.Linear(self.backbone.output_dim, len(self.label_hierarchy), bias=False)
+        self.sup_layer = LinearXavier(self.backbone.output_dim, len(self.label_hierarchy), bias=False)
         
         # STAGE 2: One head for each superclass's sublabel prediction (with > 1 sublabels)
         self.sub_layers = nn.ModuleDict({
-            str(suplabel): nn.Linear(self.backbone.output_dim, len(sublabels), bias=False) 
+            str(suplabel): LinearXavier(self.backbone.output_dim, len(sublabels), bias=False) 
             for suplabel, sublabels in self.label_hierarchy.items()
             if len(sublabels) > 1
         })
@@ -689,9 +698,9 @@ class W2VAASIST_LCL(nn.Module): # Local Classifier per Level
         
         self.normalize_before_output = normalize_before_output # When using ArcMarginProduct
         
-        self.sup_layer = nn.Linear(self.backbone.output_dim, num_suplabels, bias=False)
+        self.sup_layer = LinearXavier(self.backbone.output_dim, num_suplabels, bias=False)
         nn.init.xavier_uniform_(self.sup_layer.weight)
-        self.sub_layer = nn.Linear(self.backbone.output_dim, num_labels, bias=False)
+        self.sub_layer = LinearXavier(self.backbone.output_dim, num_labels, bias=False)
         nn.init.xavier_uniform_(self.sub_layer.weight)
         
     def forward(self, x):

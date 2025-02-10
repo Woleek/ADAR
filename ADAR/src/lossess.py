@@ -132,6 +132,57 @@ class CenterLoss(nn.Module):
         loss = dist.clamp(min=1e-9, max=1e+9).sum() / batch_size
 
         return loss
+    
+class FocalLoss(nn.Module):
+    """
+    Classic Focal Loss for multi-class classification
+    
+    Args:
+        gamma: focusing parameter
+        alpha: can be a float or a list/array for class-wise weighting
+    """
+    def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
+        super().__init__()
+        if isinstance(alpha, (float, int)):
+            # same alpha for all classes
+            self.alpha = alpha
+        else:
+            # if alpha is a list/array, convert to tensor
+            self.alpha = torch.tensor(alpha, dtype=torch.float32)
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        """
+        Args:
+            inputs: (N, C), raw logits from network output
+            targets: (N,) or (N, 1), ground truth labels
+        """
+        log_probs = F.log_softmax(inputs, dim=-1) # (N, C)
+        probs = torch.exp(log_probs) # (N, C)
+        
+        # Gather log_probs for the correct class
+        focal_part = (1 - probs) ** self.gamma # (N, C)
+        
+        # If alpha is per-class, gather for targets
+        if isinstance(self.alpha, torch.Tensor):
+            alpha_factor = self.alpha[targets]
+        else:
+            alpha_factor = self.alpha
+        
+        # NLL
+        loss = -alpha_factor * focal_part * log_probs
+
+        # Pick the loss values corresponding to the correct class
+        loss = loss.gather(dim=-1, index=targets.unsqueeze(-1))
+        loss = loss.squeeze(-1) # (N,)
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
 
     
 # https://github.com/ronghuaiyang/arcface-pytorch/blob/47ace80b128042cd8d2efd408f55c5a3e156b032/models/metrics.py

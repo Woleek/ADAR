@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data.sampler as torch_sampler
+from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -16,7 +17,7 @@ from src import utils
 from src.datasets.utils import HuggingFaceFeatureExtractor
 from src.datasets.dataset import MLAADFD_AR_Dataset, MLAADFDDataset
 from src.models.w2v2_aasist import W2VAASIST_LCL, W2VAASIST_LCPN
-from src.lossess import ArcMarginProduct, SubcenterArcMarginProduct
+from src.lossess import ArcMarginProduct, SubcenterArcMarginProduct, FocalLoss
 
 
 def parse_args():
@@ -93,9 +94,9 @@ def parse_args():
     parser.add_argument(
         "--hierarchy_type",
         type=str,
-        default="multi-task",
-        choices=["multi-task", "cascade"],
-        help="Type of training for hierarchical classification (multi-task or cascade)",
+        default="LCL",
+        choices=["LCL", "LCPN"],
+        help="Type of training for hierarchical classification (LCL or LCPN)",
     )
     parser.add_argument(
         "--superclass_lut",
@@ -119,25 +120,22 @@ def parse_args():
         "--num_epochs", type=int, default=30, help="Number of epochs for training"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=128, help="Batch size for training"
+        "--batch_size", type=int, default=256, help="Batch size for training"
     )
     parser.add_argument(
         "--weighted_sampling", type=bool, default=False, help="Draw samples from train dataset with weighted probability based on class distribution"
     )
-    parser.add_argument("--lr", type=float, default=0.0005, help="learning rate")
-    parser.add_argument(
-        "--lr_decay", type=float, default=0.5, help="decay learning rate"
-    )
+    parser.add_argument("--lr", type=float, default=1e-3, help="learning rate")
     parser.add_argument("--interval", type=int, default=10, help="interval to decay lr")
-    parser.add_argument("--beta_1", type=float, default=0.9, help="bata_1 for Adam")
-    parser.add_argument("--beta_2", type=float, default=0.999, help="beta_2 for Adam")
-    parser.add_argument("--eps", type=float, default=1e-8, help="epsilon for Adam")
+    parser.add_argument("--beta_1", type=float, default=0.9, help="bata_1 for AdamW")
+    parser.add_argument("--beta_2", type=float, default=0.999, help="beta_2 for AdamW")
+    parser.add_argument("--eps", type=float, default=1e-8, help="epsilon for AdamW")
     parser.add_argument("--num_workers", type=int, default=0, help="number of workers")
     parser.add_argument(
         "--base_loss",
         type=str,
         default="ce",
-        choices=["ce"],
+        choices=["ce", "focal"],
         help="Loss for basic training",
     )
     parser.add_argument(
@@ -145,6 +143,12 @@ def parse_args():
         type=float,
         default=0.0,
         help="Label smoothing factor [0.0 - 1.0] for the loss function"
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=2.0, #TODO: Try 1.0
+        help="Focal loss gamma parameter"
     )
     
     # Resume training
@@ -177,7 +181,7 @@ def parse_args():
     parser.add_argument("--use_arc_margin", action="store_true", help="Use ArcMarginProduct")
     parser.add_argument("--use_sub-center-arc_margin", action="store_true", help="Use Sub-Center ArcMarginProduct")
     
-    parser.add_argument("--arc_s", type=float_or_str, default="auto", help="Scale parameter s for ArcMarginProduct")
+    parser.add_argument("--arc_s", type=float_or_str, default=30, help="Scale parameter s for ArcMarginProduct") # TODO: Try 30, 64, "auto"
     parser.add_argument("--arc_m", type=float, default=0.5, help="Margin parameter m for ArcMarginProduct")
     parser.add_argument("--easy_margin", type=bool, default=False, help="Use easy margin in ArcMarginProduct")
     parser.add_argument("--optimize_arc_margin_weights", type=bool, default=True, help="Optimize ArcMarginProduct weights")
@@ -231,7 +235,7 @@ def train(args):
             training_set.sample_weights, len(training_set), 
             replacement=True
         )
-        print(f"Using weighted sampling (undersampling)")
+        print(f"Using weighted sampling")
     else:
         train_sampler = torch_sampler.SubsetRandomSampler(range(len(training_set)))
 
@@ -254,6 +258,10 @@ def train(args):
     if args.base_loss == "ce":
         criterion = nn.CrossEntropyLoss(
             label_smoothing=args.label_smoothing
+        )
+    elif args.base_loss == "focal":
+        criterion = FocalLoss(
+            gamma=args.gamma
         )
     else:
         raise ValueError(f"Loss function {args.base_loss} not supported")
@@ -296,7 +304,7 @@ def train(args):
     if args.use_sub_center_arc_margin: # TODO: Implement Subcenter for hierarchical classification
         raise ValueError("Not implemented with Subcenter yet")
     
-    if args.hierarchy_type == "multi-task":
+    if args.hierarchy_type == "LCL":
         num_sup_classes = len(set(id_map.values())) # Number of superclasses
         num_sub_classes = args.num_classes # Number of original (global) classes
         
@@ -309,7 +317,7 @@ def train(args):
                 else False
         ).to(args.device)
         
-    elif args.hierarchy_type == "cascade":
+    elif args.hierarchy_type == "LCPN":
         model = W2VAASIST_LCPN(
             feature_dim=args.feat_dim,
             label_mapping=id_map,
@@ -328,24 +336,36 @@ def train(args):
         start_epoch = int(args.resume_epoch)
         
     # Main optimizer + arc_margin params (optional)
-    feat_optimizer = torch.optim.Adam(
+    feat_optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
         betas=(args.beta_1, args.beta_2),
         eps=args.eps,
-        weight_decay=0.0005
+        weight_decay=0.01
     )
     
     if args.resume_optimizer:
         feat_optimizer.load_state_dict(torch.load(args.resume_optimizer, weights_only=True))
+        
+    # Scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        feat_optimizer, 
+        T_0=5,      # e.g. restart every 5 epochs
+        T_mult=1,   # the period grows by x after each restart
+        eta_min=1e-6
+    )
     
     print(f"Training a {type(model).__name__} model for {args.num_epochs} epochs")
 
-    prev_loss = 1e8
+    best_val_loss = float("inf")
+    global_step = 0
+    
+    writer = SummaryWriter(log_dir=os.path.join(args.out_folder, 'logs'))
+    
     # Main training loop
     for epoch_num in range(start_epoch, args.num_epochs + start_epoch):
         model.train()
-        utils.adjust_learning_rate(args, args.lr, feat_optimizer, epoch_num)
+        # utils.adjust_learning_rate(args, args.lr, feat_optimizer, epoch_num)
 
         epoch_bar = tqdm(train_loader, desc=f"Epoch [{epoch_num+1}/{args.num_epochs + start_epoch}]")
         
@@ -372,7 +392,7 @@ def train(args):
             feat = feat.transpose(1, 2).to(args.device)
 
             # ---- Forward pass ----
-            if args.hierarchy_type == "multi-task":
+            if args.hierarchy_type == "LCL":
                 feats, logits = model(feat) # feats - last hidden, logits - model output from linear(s)
                 sup_logits, sub_logits = logits
                 
@@ -398,9 +418,9 @@ def train(args):
                 sup_acc = (sup_predicted == sup_labels).float().mean().item()
                 sub_acc = (sub_predicted == global_labels).float().mean().item()
                 
-            elif args.hierarchy_type == "cascade":    
+            elif args.hierarchy_type == "LCPN":    
                 # get hierarchical sublabels
-                sub_labels = global_labels.copy().to('cpu')
+                sub_labels = global_labels.to('cpu')
                 sub_labels.apply_(lambda x: model.get_local_label(x)[1])
                 sub_labels = sub_labels.to(args.device)
                 
@@ -433,14 +453,22 @@ def train(args):
                 for sup_label in sup_labels.unique():
                     key = int(sup_label.item())
                     
-                    if str(key) not in model.sub_layers:
-                        continue # Skip if superclass has no subclasses
-                    
                     # Get corresponding indices
                     mask = (sup_labels == sup_label)
                     if mask.sum() == 0:
                         continue
                     
+                    # CASE 1: Skip subclass step if there's only one subclass or no sub-layer
+                    # (Count them as correct if the superclass is correct)
+                    if str(key) not in model.sub_layers:
+                        with torch.no_grad():
+                            for idx in torch.where(mask)[0]:
+                                if sup_predicted[idx] == sup_labels[idx]:
+                                    total_sub_correct += 1
+                            total_sub_samples += mask.sum().item()
+                            continue
+                    
+                    # CASE 2: Otherwise, do normal subclass classification
                     feats_subset = feats[mask]
                     sub_labels_subset = sub_labels[mask]
                     
@@ -461,13 +489,20 @@ def train(args):
                     with torch.no_grad():
                         sub_score = F.softmax(sub_logits_valid, dim=1)
                         sub_predicted = torch.argmax(sub_score, dim=1)
-                        total_sub_correct += (sub_predicted == sub_labels_subset).sum().item()
+                        
+                        # Get global labels for metrics
+                        global_predicted = sub_predicted.to('cpu')
+                        global_labels_subset = global_labels[mask].to('cpu')
+                        global_predicted.apply_(lambda x: model.get_global_label(key, x))
+                        
+                        total_sub_correct += (global_predicted == global_labels_subset).sum().item()
                         total_sub_samples += mask.sum().item()
                     
                 if num_sub_losses > 0:
                     loss_sub /= num_sub_losses
                     
-                loss_base = 0.5 * (loss_sup + loss_sub) # TODO: Consider weighting
+                alpha = 0.5
+                loss_base = alpha * loss_sup + (1 - alpha) * loss_sub
                 total_loss += loss_base
                 
                 if total_sub_samples > 0:
@@ -479,16 +514,27 @@ def train(args):
             feat_optimizer.zero_grad()    
             total_loss.backward()
             feat_optimizer.step()
+            scheduler.step(epoch_num + iter_num / len(train_loader))
                 
             train_sup_accuracy += sup_acc
             train_sub_accuracy += sub_acc
             train_loss += total_loss.item()
             
+            global_step += 1
+            
+            writer.add_scalar("Train/Sup_Acc", sup_acc, global_step)
+            writer.add_scalar("Train/Global_Acc", sub_acc, global_step)
+            writer.add_scalar("Train/Loss_Sup", loss_sup.item(), global_step)
+            writer.add_scalar("Train/Loss_Sub", loss_sub.item(), global_step)
+            
             epoch_bar.set_postfix({
                 "sup_acc": f"{train_sup_accuracy/(iter_num+1):.2f}",
-                "sub_acc": f"{train_sub_accuracy/(iter_num+1):.2f}",
-                "loss": f"{train_loss/(iter_num+1):.4f}"
+                "glob_acc": f"{train_sub_accuracy/(iter_num+1):.2f}",
+                "loss": f"{train_loss/(iter_num+1):.4f}",
+                "lr": f"{feat_optimizer.param_groups[0]['lr']:.6f}"
             })
+            
+        # scheduler.step(epoch_num + 1) 
                 
         epoch_train_loss = train_loss/len(train_loader)
         epoch_train_sup_acc = train_sup_accuracy/len(train_loader)
@@ -519,7 +565,7 @@ def train(args):
                         
                 feat = feat.transpose(1, 2).to(args.device)
 
-                if args.hierarchy_type == "multi-task":
+                if args.hierarchy_type == "LCL":
                     feats, logits = model(feat)
                     sup_logits, sub_logits = logits
                 
@@ -544,8 +590,8 @@ def train(args):
                     sup_acc = (sup_predicted == sup_labels).float().mean().item()
                     sub_acc = (sub_predicted == global_labels).float().mean().item()
                     
-                elif args.hierarchy_type == "cascade":
-                    sub_labels = global_labels.copy().to('cpu')
+                elif args.hierarchy_type == "LCPN":
+                    sub_labels = global_labels.to('cpu')
                     sub_labels.apply_(lambda x: model.get_local_label(x)[1])
                     sub_labels = sub_labels.to(args.device)
                     
@@ -572,15 +618,20 @@ def train(args):
                     total_sub_correct = 0
                     total_sub_samples = 0
                     
-                    for sup_label in sup_labels.unique():
+                    for sup_label in sup_labels.unique(): # Teacher forcing
                         key = int(sup_label.item())
-                        
-                        if str(key) not in model.sub_layers:
-                            continue
                         
                         mask = (sup_labels == sup_label)
                         if mask.sum() == 0:
                             continue
+                        
+                        if str(key) not in model.sub_layers:
+                            with torch.no_grad():
+                                for idx in torch.where(mask)[0]:
+                                    if sup_predicted[idx] == sup_labels[idx]:
+                                        total_sub_correct += 1
+                                total_sub_samples += mask.sum().item()
+                                continue
                         
                         feats_subset = feats[mask]
                         sub_labels_subset = sub_labels[mask]
@@ -601,13 +652,20 @@ def train(args):
                         
                         sub_score = F.softmax(sub_logits_valid, dim=1)
                         sub_predicted = torch.argmax(sub_score, dim=1)
-                        total_sub_correct += (sub_predicted == sub_labels_subset).sum().item()
+                        
+                        # Get global labels for metrics
+                        global_predicted = sub_predicted.to('cpu')
+                        global_labels_subset = global_labels[mask].to('cpu')
+                        global_predicted.apply_(lambda x: model.get_global_label(key, x))
+                        
+                        total_sub_correct += (global_predicted == global_labels_subset).sum().item()
                         total_sub_samples += mask.sum().item()
                         
                     if num_sub_losses > 0:
                         sub_loss /= num_sub_losses
                         
-                    loss = 0.5 * (sup_loss + sub_loss)
+                    alpha = 0.5
+                    loss = alpha * sup_loss + (1 - alpha) * sub_loss
                     
                     if total_sub_samples > 0:
                         sub_acc = total_sub_correct / total_sub_samples
@@ -618,20 +676,22 @@ def train(args):
                 val_sub_accuracy += sub_acc
                 val_loss += loss.item()
                 
-                val_bar.set_postfix(
-                    {
-                        "val_sup_acc": f"{val_sup_accuracy/(iter_num+1):.2f}",
-                        "val_sub_acc": f"{val_sub_accuracy/(iter_num+1):.2f}",
-                        "val_loss": f"{val_loss/(iter_num+1):.4f}",
-                    }
-                )
+                val_bar.set_postfix({
+                    "val_sup_acc": f"{val_sup_accuracy/(iter_num+1):.2f}",
+                    "val_glob_acc": f"{val_sub_accuracy/(iter_num+1):.2f}",
+                    "val_loss": f"{val_loss/(iter_num+1):.4f}",
+                })
 
         epoch_val_loss = val_loss/len(dev_loader)
         epoch_val_sup_acc = val_sup_accuracy/len(dev_loader)
         epoch_val_sub_acc = val_sub_accuracy/len(dev_loader)
         
-        if epoch_val_loss < prev_loss:
-            prev_loss = epoch_val_loss
+        writer.add_scalar("Val/Sup_Acc", epoch_val_sup_acc, epoch_num+1)
+        writer.add_scalar("Val/Global_Acc", epoch_val_sub_acc, epoch_num+1)
+        writer.add_scalar("Val/Loss", epoch_val_loss, epoch_num+1)
+        
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
             
             # Gather model state
             state = model.state_dict()
@@ -651,10 +711,10 @@ def train(args):
                     "epoch": epoch_num + 1,
                     "train_loss": epoch_train_loss, 
                     "train_sup_acc": epoch_train_sup_acc,
-                    "train_sub_acc": epoch_train_sub_acc,
+                    "train_glob_acc": epoch_train_sub_acc,
                     "val_loss": epoch_val_loss,
                     "val_sup_acc": epoch_val_sup_acc,
-                    "val_sub_acc": epoch_val_sub_acc
+                    "val_glob_acc": epoch_val_sub_acc
                 }
             )
 
@@ -678,13 +738,14 @@ def train(args):
                     "epoch": epoch_num + 1,
                     "train_loss": epoch_train_loss, 
                     "train_sup_acc": epoch_train_sup_acc,
-                    "train_sub_acc": epoch_train_sub_acc,
+                    "train_glob_acc": epoch_train_sub_acc,
                     "val_loss": epoch_val_loss,
                     "val_sup_acc": epoch_val_sup_acc,
-                    "val_sub_acc": epoch_val_sub_acc
+                    "val_glob_acc": epoch_val_sub_acc
                 },
                 epoch=epoch_num + 1 # Save as intermediate checkpoint
             )
+        writer.close()
         print("\n")
 
 

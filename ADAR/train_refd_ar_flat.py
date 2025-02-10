@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data.sampler as torch_sampler
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from src import utils
@@ -104,15 +105,12 @@ def parse_args():
         "--num_epochs", type=int, default=30, help="Number of epochs for training"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=128, help="Batch size for training"
+        "--batch_size", type=int, default=256, help="Batch size for training"
     )
     parser.add_argument(
         "--weighted_sampling", type=bool, default=False, help="Draw samples from train dataset with weighted probability based on class distribution"
     )
-    parser.add_argument("--lr", type=float, default=0.0005, help="learning rate")
-    parser.add_argument(
-        "--lr_decay", type=float, default=0.5, help="decay learning rate"
-    )
+    parser.add_argument("--lr", type=float, default=1e-3, help="learning rate")
     parser.add_argument("--interval", type=int, default=10, help="interval to decay lr")
     parser.add_argument("--beta_1", type=float, default=0.9, help="bata_1 for Adam")
     parser.add_argument("--beta_2", type=float, default=0.999, help="beta_2 for Adam")
@@ -162,7 +160,7 @@ def parse_args():
     parser.add_argument("--use_arc_margin", action="store_true", help="Use ArcMarginProduct")
     parser.add_argument("--use_sub-center-arc_margin", action="store_true", help="Use Sub-Center ArcMarginProduct")
     
-    parser.add_argument("--arc_s", type=float_or_str, default="auto", help="Scale parameter s for ArcMarginProduct")
+    parser.add_argument("--arc_s", type=float_or_str, default=30, help="Scale parameter s for ArcMarginProduct")
     parser.add_argument("--arc_m", type=float, default=0.5, help="Margin parameter m for ArcMarginProduct")
     parser.add_argument("--easy_margin", type=bool, default=False, help="Use easy margin in ArcMarginProduct")
     parser.add_argument("--k_centers", type=int, default=1, help="Number of centers for Sub-Center ArcMarginProduct")
@@ -214,9 +212,9 @@ def train(args):
     if args.weighted_sampling:
         train_sampler = torch_sampler.WeightedRandomSampler(
             training_set.sample_weights, len(training_set), 
-            replacement=False # No oversampling
+            replacement=True
         )
-        print(f"Using weighted sampling (undersampling)")
+        print(f"Using weighted sampling")
     else:
         train_sampler = torch_sampler.SubsetRandomSampler(range(len(training_set)))
 
@@ -310,12 +308,12 @@ def train(args):
         start_epoch = int(args.resume_epoch)
         
     # Main optimizer + arc_margin params (optional)
-    feat_optimizer = torch.optim.Adam(
+    feat_optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
         betas=(args.beta_1, args.beta_2),
         eps=args.eps,
-        weight_decay=0.0005
+        weight_decay=0.01
     )
     
     if args.resume_optimizer:
@@ -323,18 +321,30 @@ def train(args):
         
     if args.resume_center_loss_optimizer:
         center_loss_optimizer.load_state_dict(torch.load(args.resume_center_loss_optimizer, weights_only=True))
+        
+    # Scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        feat_optimizer, 
+        T_0=5,      # e.g. restart every 5 epochs
+        T_mult=1,   # the period grows by x2 after each restart
+        eta_min=1e-6
+    )
     
     print(f"Training a {type(model).__name__} model for {args.num_epochs} epochs")
 
-    prev_loss = 1e8
+    best_val_loss = float("inf")
+    global_step = 0
+    
+    writer = SummaryWriter(log_dir=os.path.join(args.out_folder, 'logs'))
+    
     # Main training loop
     for epoch_num in range(start_epoch, args.num_epochs + start_epoch):
         model.train()
-        utils.adjust_learning_rate(args, args.lr, feat_optimizer, epoch_num)
+        # utils.adjust_learning_rate(args, args.lr, feat_optimizer, epoch_num)
 
         epoch_bar = tqdm(train_loader, desc=f"Epoch [{epoch_num+1}/{args.num_epochs + start_epoch}]")
         
-        train_accuracy, train_loss = [], []     
+        train_accuracy, train_loss = 0.0, 0.0   
         for iter_num, batch in enumerate(epoch_bar):
             feat, _, labels = batch # audio_sample, path, class_id
             
@@ -386,6 +396,9 @@ def train(args):
                 for param in center_loss_fn.parameters():
                     param.grad.data *= (1. / args.center_loss_weight)
                 center_loss_optimizer.step()
+             
+            # scheduler step   
+            scheduler.step(epoch_num + iter_num / len(train_loader))
             
             # ---- Scores ----
             with torch.no_grad():        
@@ -393,24 +406,26 @@ def train(args):
                 predicted = torch.argmax(score, dim=1)
                 acc = (predicted == labels).float().mean()
       
-            train_accuracy.append(acc.item())
-            train_loss.append(total_loss.item())
+            train_accuracy += acc.item()
+            train_loss += total_loss.item()
+            
+            writer.add_scalar("Train/Global_Acc", train_accuracy, global_step)
+            writer.add_scalar("Train/Loss", train_loss, global_step)
                 
-            epoch_bar.set_postfix(
-                {
-                    "acc": f"{sum(train_accuracy)/(iter_num+1):.2f}",
-                    "train_loss": f"{sum(train_loss)/(iter_num+1):.4f}"
-                }
-            )
+            epoch_bar.set_postfix({
+                "glob_acc": f"{train_accuracy/(iter_num+1):.2f}",
+                "loss": f"{train_loss/(iter_num+1):.4f}",
+                "lr": f"{feat_optimizer.param_groups[0]['lr']:.6f}"
+            })
    
-        epoch_train_loss = sum(train_loss) / (iter_num + 1)
-        epoch_train_acc = sum(train_accuracy) / (iter_num + 1)
+        epoch_train_loss = train_loss/len(train_loader)
+        epoch_train_acc = train_accuracy/len(train_loader)
 
         # Epoch eval
         model.eval()
         with torch.no_grad():
             val_bar = tqdm(dev_loader, desc=f"Validation for epoch {epoch_num+1}")
-            val_accuracy, val_loss = [], []
+            val_accuracy, val_loss = 0.0, 0.0
             for iter_num, batch in enumerate(val_bar):
                 feat, _, labels = batch
                 
@@ -447,20 +462,21 @@ def train(args):
                 predicted = torch.argmax(score, dim=1)
                 acc = (predicted == labels).float().mean()
                 
-                val_accuracy.append(acc.item())
-                val_loss.append(loss.item())
+                val_accuracy += acc.item()
+                val_loss += loss.item()
                 
-                val_bar.set_postfix(
-                    {
-                        "val_loss": f"{sum(val_loss)/(iter_num+1):.4f}",
-                        "val_acc": f"{sum(val_accuracy)/(iter_num+1):.2f}",
-                    }
-                )
+                val_bar.set_postfix({
+                    "val_loss": f"{val_loss/(iter_num+1):.4f}",
+                    "val_acc": f"{val_accuracy/(iter_num+1):.2f}",
+                })
 
-        epoch_val_loss = sum(val_loss) / (iter_num + 1)
-        epoch_val_acc = sum(val_accuracy) / (iter_num + 1)
+        epoch_val_loss = val_loss / len(dev_loader)
+        epoch_val_acc = val_accuracy / len(dev_loader)
         
-        if epoch_val_loss < prev_loss:
+        writer.add_scalar("Val/Global_Acc", epoch_val_acc, epoch_num+1)
+        writer.add_scalar("Val/Loss", epoch_val_loss, epoch_num+1)
+        
+        if epoch_val_loss < best_val_loss:
             state = model.state_dict()
             
             if args.use_arc_margin or args.use_sub_center_arc_margin:         
@@ -479,9 +495,9 @@ def train(args):
                 training_stats={
                     "epoch": epoch_num + 1,
                     "train_loss": epoch_train_loss, 
-                    "train_acc": epoch_train_acc,
+                    "train_glob_acc": epoch_train_acc,
                     "val_loss": epoch_val_loss,
-                    "val_acc": epoch_val_acc
+                    "val_glob_acc": epoch_val_acc
                 }
             )
 
@@ -505,13 +521,13 @@ def train(args):
                 training_stats={
                     "epoch": epoch_num + 1,
                     "train_loss": epoch_train_loss, 
-                    "train_acc": epoch_train_acc,
+                    "train_glob_acc": epoch_train_acc,
                     "val_loss": epoch_val_loss,
-                    "val_acc": epoch_val_acc
+                    "val_glob_acc": epoch_val_acc
                 },
                 epoch=epoch_num + 1 # Save intermediate checkpoint
             )
-                
+        writer.close()
         print("\n")
         
 
