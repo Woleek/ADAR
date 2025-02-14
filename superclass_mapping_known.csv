@@ -1,0 +1,25 @@
+Class,Superclass,Class ID,Superclass ID
+Mars5,Other,0,-1
+MeloTTS,Other,1,-1
+Metavoice-1B,Other,2,-1
+facebook/mms-tts-deu,Other,3,-1
+griffin_lim,Other,4,-1
+suno/bark,Bark,5,3
+suno/bark-small,Bark,6,3
+tts_models/de/css10/vits-neon,VITS,7,2
+tts_models/de/thorsten/tacotron2-DDC,Tacotron,8,1
+tts_models/en/ljspeech/fast_pitch,Other,9,-1
+tts_models/en/ljspeech/speedy-speech,Other,10,-1
+tts_models/en/ljspeech/tacotron2-DCA,Tacotron,11,1
+tts_models/en/ljspeech/tacotron2-DDC,Tacotron,12,1
+tts_models/en/ljspeech/tacotron2-DDC_ph,Tacotron,13,1
+tts_models/en/ljspeech/vits--neon,VITS,14,2
+tts_models/fr/css10/vits,VITS,15,2
+tts_models/fr/mai/tacotron2-DDC,Tacotron,16,1
+tts_models/it/mai_female/glow-tts,Other,17,-1
+tts_models/it/mai_female/vits,VITS,18,2
+tts_models/it/mai_male/vits,VITS,19,2
+tts_models/lt/cv/vits,VITS,20,2
+tts_models/multilingual/multi-dataset/xtts_v1.1,XTTS,21,0
+tts_models/multilingual/multi-dataset/xtts_v2,XTTS,22,0
+vixTTS,Other,23,-1
