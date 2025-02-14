@@ -1,5 +1,6 @@
 # Adapted from https://github.com/piotrkawa/audio-deepfake-source-tracing
 
+import math
 from typing import Dict, List, Tuple, Union
 
 import torch
@@ -578,8 +579,9 @@ class W2VAASIST(nn.Module):
         return last_hidden, output
         
 class W2VAASIST_LCPN(nn.Module): # Local Classifier per Parent Node
-    def __init__(self, feature_dim: int, label_mapping: Dict[int, int], normalize_before_output=False):
+    def __init__(self, feature_dim: int, label_mapping: Dict[int, int], normalize_before_output=False, K=None):
         super().__init__()
+        self.K = K or 1
         self.backbone = W2VAASIST_Backbone(feature_dim)
         
         self.normalize_before_output = normalize_before_output # When using ArcMarginProduct
@@ -587,11 +589,11 @@ class W2VAASIST_LCPN(nn.Module): # Local Classifier per Parent Node
         self._prepare_labels(label_mapping)
         
         # STAGE 1: One head for the superclass prediction
-        self.sup_layer = LinearXavier(self.backbone.output_dim, len(self.label_hierarchy), bias=False)
+        self.sup_layer = LinearXavier(self.backbone.output_dim, len(self.label_hierarchy) * self.K, bias=False)
         
         # STAGE 2: One head for each superclass's sublabel prediction (with > 1 sublabels)
         self.sub_layers = nn.ModuleDict({
-            str(suplabel): LinearXavier(self.backbone.output_dim, len(sublabels), bias=False) 
+            str(suplabel): LinearXavier(self.backbone.output_dim, len(sublabels) * self.K, bias=False) 
             for suplabel, sublabels in self.label_hierarchy.items()
             if len(sublabels) > 1
         })
@@ -640,16 +642,17 @@ class W2VAASIST_LCPN(nn.Module): # Local Classifier per Parent Node
             
         return sup_logits
     
-    def classify_subclass(self, embedding: torch.Tensor, supclass: int) -> torch.Tensor:
+    def classify_subclass(self, embedding: torch.Tensor, supclass: int, sup_logits: torch.Tensor) -> torch.Tensor:
         sub_logits = torch.full(
-            size=(embedding.size(0), self.max_sublabels),
+            size=(embedding.size(0), self.max_sublabels * self.K),
             fill_value=float('-inf'),
             device=embedding.device
         )
         
         sup_id = str(supclass)
-        if sup_id not in self.sub_layers: # No classifier for this superclass
-            sub_logits[:, 0].fill_(1)
+        if sup_id not in self.sub_layers: # No local classifier for this parent node
+            # sub_logits[:, 0:self.K] = sup_logits[:, int(sup_id) * self.K:int(sup_id)+1 * self.K] # Copy superclass logits
+            sub_logits[:, 0:self.K].fill_(1.0)
             return sub_logits
         
         if self.normalize_before_output:
@@ -660,8 +663,8 @@ class W2VAASIST_LCPN(nn.Module): # Local Classifier per Parent Node
             logits = self.sub_layers[sup_id](embedding)
             
         num_sublabels = logits.size(1)
-        sub_logits[:, :num_sublabels] = logits
-            
+        sub_logits[:, 0:num_sublabels] = logits
+
         return sub_logits
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -669,11 +672,19 @@ class W2VAASIST_LCPN(nn.Module): # Local Classifier per Parent Node
         
         # STAGE 1: Predict superclass
         sup_logits = self.classify_supclass(last_hidden)
-        sup_preds = sup_logits.argmax(dim=1)
+        
+        # Aggregate K centers
+        if self.K > 1:
+            sup_logits_reduced = torch.reshape(sup_logits, (-1, len(self.label_hierarchy), self.K))
+            sup_logits_reduced, _ = torch.max(sup_logits_reduced, axis=2)
+        
+            sup_preds = sup_logits_reduced.argmax(dim=1)
+        else:
+            sup_preds = sup_logits.argmax(dim=1)
         
         # STAGE 2: Predict sublabels for superclasses with > 1 sublabels
         # Padded tensor for sublabel logits
-        sub_logits = torch.zeros((x.size(0), self.max_sublabels), device=x.device)
+        sub_logits = torch.zeros((x.size(0), self.max_sublabels * self.K), device=x.device)
         for sup_label in sup_preds.unique():
             
             # Get indices of samples with the current superclass
@@ -685,7 +696,7 @@ class W2VAASIST_LCPN(nn.Module): # Local Classifier per Parent Node
             embeddings_subset = last_hidden[mask]
             
             # Predict sublabels
-            logits = self.classify_subclass(embeddings_subset, int(sup_label))
+            logits = self.classify_subclass(embeddings_subset, int(sup_label), sup_logits[mask])
             sub_logits[mask] = logits
             
         output = (sup_logits, sub_logits)

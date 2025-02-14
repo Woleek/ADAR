@@ -141,7 +141,7 @@ class MLAADFDDataset(Dataset):
         part="train", 
         mode="train", 
         max_samples=-1,
-        superclass_mapping=None,
+        superclass_mapping=None
     ):
         super().__init__()
         self.path_to_features = path_to_features
@@ -178,10 +178,10 @@ class MLAADFDDataset(Dataset):
             print(f"Using {len(self.labels)} global classes with {len(unique_sup)} superclasses\n")
         else:
             print(f"Using {len(self.labels)} classes\n")
-        print(
-            "Seen classes: ",
+        print("Seen classes: ",
             set([int(os.path.basename(x).split("_")[1]) for x in self.all_files]),
         )
+        print("")
         
     def _calculate_class_weights(self):
         if self.superclass_mapping is None:
@@ -255,7 +255,7 @@ class MLAADFD_AR_Dataset(Dataset):
         # e.g. "someprefix_<GLOBAL_LABEL>_anything.wav"
         self.all_labels = [int(os.path.split(x)[1].split("_")[1]) for x in self.all_files]
         self.labels = sorted(
-            set(self.labels)
+            set(self.all_labels)
         )
             
         self.superclass_mapping = superclass_mapping
@@ -267,12 +267,17 @@ class MLAADFD_AR_Dataset(Dataset):
         else:
             self.list_of_emphases = ["original"]
         
-        self.emphasiser = WaveformEmphasiser(
-            empasizer_sampling_rate, 
-            empasizer_musan_path,
-            empasizer_rir_path,
-            segmented=segmented
-        )
+        if empasizer_pre_augmented:
+            self.emphasiser = lambda x, emphasis: torch.Tensor(x.squeeze())
+            self.wav_sampling_rate = empasizer_sampling_rate
+        else:
+            self.wav_sampling_rate = empasizer_sampling_rate
+            self.emphasiser = WaveformEmphasiser(
+                empasizer_sampling_rate, 
+                empasizer_musan_path,
+                empasizer_rir_path,
+                segmented=segmented
+            )
         
         self.all_files_emphasized = []
         self.labels_emphasized = []
@@ -302,10 +307,10 @@ class MLAADFD_AR_Dataset(Dataset):
             print(f"Using {len(self.labels)} global classes with {len(unique_sup)} superclasses\n")
         else:
             print(f"Using {len(self.labels)} classes\n")
-        print(
-            "Seen classes: ",
+        print("Seen classes: ",
             set([int(os.path.basename(x).split("_")[1]) for x in self.all_files]),
         )
+        print("")
         
     def _calculate_class_weights(self):
         if self.superclass_mapping is None:
@@ -335,8 +340,8 @@ class MLAADFD_AR_Dataset(Dataset):
         else:
             audio, sr = librosa.load(file_path, sr=None, mono=True)
             audio = np.expand_dims(audio, axis=0)
-        if sr != self.emphasiser.sampling_rate:
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=self.emphasiser.sampling_rate)
+        if sr != self.wav_sampling_rate:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=self.wav_sampling_rate)
         return audio
 
     def __len__(self):

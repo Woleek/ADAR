@@ -25,11 +25,11 @@ def parse_args():
 
     # Paths to features and output
     parser.add_argument(
-        "-f",
+        "-d",
         "--path_to_dataset",
         type=str,
         default="data/prepared_ds/",
-        help="Path to the previuosly extracted features",
+        help="Path to the dataset",
     )
     parser.add_argument(
         "--is_segmented",
@@ -147,7 +147,7 @@ def parse_args():
     parser.add_argument(
         "--gamma",
         type=float,
-        default=2.0, #TODO: Try 1.0
+        default=2.0,
         help="Focal loss gamma parameter"
     )
     
@@ -253,6 +253,7 @@ def train(args):
     )
     
     start_epoch = 0
+    global_step = 0
     
     # Set up loss functions
     if args.base_loss == "ce":
@@ -276,6 +277,7 @@ def train(args):
             m=args.arc_m,
             easy_margin=args.easy_margin
         ).to(args.device)
+        print("Using easy margin: ", args.easy_margin)
         
     if args.use_sub_center_arc_margin:
         print(f"[INFO] Using Sub-Center ArcFace Loss with {args.k_centers} centers per class...")
@@ -300,13 +302,14 @@ def train(args):
             
         feature_extractor.model.eval()
         
-    # Setup the model to learn in-domain classess
-    if args.use_sub_center_arc_margin: # TODO: Implement Subcenter for hierarchical classification
-        raise ValueError("Not implemented with Subcenter yet")
-    
+    # Setup the model to learn in-domain classess    
     if args.hierarchy_type == "LCL":
         num_sup_classes = len(set(id_map.values())) # Number of superclasses
         num_sub_classes = args.num_classes # Number of original (global) classes
+        
+        if args.use_sub_center_arc_margin:
+            num_sup_classes *= args.k_centers
+            num_sub_classes *= args.k_centers
         
         model = W2VAASIST_LCL(
             feature_dim=args.feat_dim, 
@@ -323,7 +326,8 @@ def train(args):
             label_mapping=id_map,
             normalize_before_output=True # ArcMargin expects normalized embeddings
                 if (args.use_arc_margin or args.use_sub_center_arc_margin) 
-                else False
+                else False,
+            K=args.k_centers if args.use_sub_center_arc_margin else None
         ).to(args.device)
     
     else:
@@ -331,9 +335,10 @@ def train(args):
     
     if args.resume_checkpoint and args.resume_epoch:
         print(f"Resuming training from checkpoint {args.resume_checkpoint} at epoch {args.resume_epoch}")
-        model.load_state_dict(torch.load(args.resume_checkpoint, weights_only=True))
+        model.load_state_dict(torch.load(args.resume_checkpoint, weights_only=True), strict=False)
         
         start_epoch = int(args.resume_epoch)
+        global_step = start_epoch * len(train_loader)
         
     # Main optimizer + arc_margin params (optional)
     feat_optimizer = torch.optim.AdamW(
@@ -347,18 +352,16 @@ def train(args):
     if args.resume_optimizer:
         feat_optimizer.load_state_dict(torch.load(args.resume_optimizer, weights_only=True))
         
-    # Scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        feat_optimizer, 
-        T_0=5,      # e.g. restart every 5 epochs
-        T_mult=1,   # the period grows by x after each restart
-        eta_min=1e-6
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        feat_optimizer,
+        mode="min",
+        factor=0.1,
+        patience=5,
     )
     
     print(f"Training a {type(model).__name__} model for {args.num_epochs} epochs")
 
     best_val_loss = float("inf")
-    global_step = 0
     
     writer = SummaryWriter(log_dir=os.path.join(args.out_folder, 'logs'))
     
@@ -473,10 +476,10 @@ def train(args):
                     sub_labels_subset = sub_labels[mask]
                     
                     # Get padded subclass logits
-                    sub_logits_group = model.classify_subclass(feats_subset, key)
+                    sub_logits_group = model.classify_subclass(feats_subset, key, sup_logits[mask])
                     
                     # Extract valid logits
-                    valid_count = len(model.label_hierarchy[key])
+                    valid_count = len(model.label_hierarchy[key] * model.K)
                     sub_logits_valid = sub_logits_group[:, :valid_count]
                     
                     if args.use_arc_margin or args.use_sub_center_arc_margin: # Apply ArcMarginProduct
@@ -514,7 +517,6 @@ def train(args):
             feat_optimizer.zero_grad()    
             total_loss.backward()
             feat_optimizer.step()
-            scheduler.step(epoch_num + iter_num / len(train_loader))
                 
             train_sup_accuracy += sup_acc
             train_sub_accuracy += sub_acc
@@ -571,7 +573,16 @@ def train(args):
                 
                     # Use model's default output logits - do not apply margin
                     if args.use_sub_center_arc_margin:
-                        raise ValueError("Not implemented with Subcenter yet")
+                        if arc_margin.K > 1:
+                            batch_size = sup_logits.shape[0]
+                            
+                            sup_logits = torch.reshape(sup_logits, (batch_size, -1, arc_margin.K))
+                            sup_logits, _ = torch.max(sup_logits, axis=2)
+                            sup_logits = arc_margin.scale(sup_logits)
+                            
+                            sub_logits = torch.reshape(sub_logits, (batch_size, -1, arc_margin.K))
+                            sub_logits, _ = torch.max(sub_logits, axis=2)
+                            sub_logits = arc_margin.scale(sub_logits)
                             
                     elif args.use_arc_margin:
                         sup_logits = arc_margin.scale(sup_logits)
@@ -600,7 +611,12 @@ def train(args):
                     # STAGE 1
                     sup_logits = model.classify_supclass(feats)
                     if args.use_sub_center_arc_margin:
-                        raise ValueError("Not implemented with Subcenter yet")
+                        if arc_margin.K > 1:
+                            batch_size = sup_logits.shape[0]
+                            
+                            sup_logits = torch.reshape(sup_logits, (batch_size, -1, arc_margin.K))
+                            sup_logits, _ = torch.max(sup_logits, axis=2)
+                            sup_logits = arc_margin.scale(sup_logits)
                             
                     elif args.use_arc_margin:
                         sup_logits = arc_margin.scale(sup_logits)
@@ -638,11 +654,16 @@ def train(args):
                         
                         sub_logits_group = model.classify_subclass(feats_subset, key)
                         
-                        valid_count = len(model.label_hierarchy[key])
+                        valid_count = len(model.label_hierarchy[key] * model.K)
                         sub_logits_valid = sub_logits_group[:, :valid_count]
                         
                         if args.use_sub_center_arc_margin:
-                            raise ValueError("Not implemented with Subcenter yet")
+                            if arc_margin.K > 1:
+                                valid_size = sub_logits_valid.shape[0]
+                                
+                                sub_logits_valid = torch.reshape(sub_logits_valid, (valid_size, -1, arc_margin.K))
+                                sub_logits_valid, _ = torch.max(sub_logits_valid, axis=2)
+                                sub_logits_valid = arc_margin.scale(sub_logits_valid)
                                 
                         elif args.use_arc_margin:
                             sub_logits_valid = arc_margin.scale(sub_logits_valid)
@@ -685,6 +706,8 @@ def train(args):
         epoch_val_loss = val_loss/len(dev_loader)
         epoch_val_sup_acc = val_sup_accuracy/len(dev_loader)
         epoch_val_sub_acc = val_sub_accuracy/len(dev_loader)
+        
+        scheduler.step(epoch_val_loss)
         
         writer.add_scalar("Val/Sup_Acc", epoch_val_sup_acc, epoch_num+1)
         writer.add_scalar("Val/Global_Acc", epoch_val_sub_acc, epoch_num+1)

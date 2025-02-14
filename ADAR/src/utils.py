@@ -38,6 +38,7 @@ def load_superclass_mapping(dataset_path, superclass_mapping_path):
     for sub, sup in id_map.items():
         if sup == -1:
             id_map[sub] = next_new_id
+            # id_map[sub] = num_sup - 1
             next_new_id += 1
         
     return id_map, name_map

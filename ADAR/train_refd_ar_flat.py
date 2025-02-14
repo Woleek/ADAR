@@ -25,11 +25,11 @@ def parse_args():
 
     # Paths to features and output
     parser.add_argument(
-        "-f",
+        "-d",
         "--path_to_dataset",
         type=str,
         default="data/prepared_ds/",
-        help="Path to the previuosly extracted features",
+        help="Path to the dataset",
     )
     parser.add_argument(
         "--is_segmented",
@@ -234,6 +234,7 @@ def train(args):
     )
     
     start_epoch = 0
+    global_step = 0
     
     # Set up loss functions
     if args.base_loss == "ce":
@@ -306,6 +307,7 @@ def train(args):
         model.load_state_dict(torch.load(args.resume_checkpoint, weights_only=True))
         
         start_epoch = int(args.resume_epoch)
+        global_step = start_epoch * len(train_loader)
         
     # Main optimizer + arc_margin params (optional)
     feat_optimizer = torch.optim.AdamW(
@@ -322,18 +324,16 @@ def train(args):
     if args.resume_center_loss_optimizer:
         center_loss_optimizer.load_state_dict(torch.load(args.resume_center_loss_optimizer, weights_only=True))
         
-    # Scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        feat_optimizer, 
-        T_0=5,      # e.g. restart every 5 epochs
-        T_mult=1,   # the period grows by x2 after each restart
-        eta_min=1e-6
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        feat_optimizer,
+        mode="min",
+        factor=0.1,
+        patience=5,
     )
     
     print(f"Training a {type(model).__name__} model for {args.num_epochs} epochs")
 
     best_val_loss = float("inf")
-    global_step = 0
     
     writer = SummaryWriter(log_dir=os.path.join(args.out_folder, 'logs'))
     
@@ -397,8 +397,6 @@ def train(args):
                     param.grad.data *= (1. / args.center_loss_weight)
                 center_loss_optimizer.step()
              
-            # scheduler step   
-            scheduler.step(epoch_num + iter_num / len(train_loader))
             
             # ---- Scores ----
             with torch.no_grad():        
@@ -409,8 +407,10 @@ def train(args):
             train_accuracy += acc.item()
             train_loss += total_loss.item()
             
-            writer.add_scalar("Train/Global_Acc", train_accuracy, global_step)
-            writer.add_scalar("Train/Loss", train_loss, global_step)
+            global_step += 1
+            
+            writer.add_scalar("Train/Global_Acc", acc.item(), global_step)
+            writer.add_scalar("Train/Loss", total_loss.item(), global_step)
                 
             epoch_bar.set_postfix({
                 "glob_acc": f"{train_accuracy/(iter_num+1):.2f}",
@@ -449,7 +449,8 @@ def train(args):
                 if args.use_sub_center_arc_margin:
                     # Aggregate sub-center outputs
                     if arc_margin.K > 1:
-                        logits = torch.reshape(logits, (-1, arc_margin.out_features, arc_margin.K))
+                        batch_size = logits.shape[0]
+                        logits = torch.reshape(logits, (batch_size, -1, arc_margin.K))
                         logits, _ = torch.max(logits, axis=2)
                         logits = arc_margin.scale(logits) # TODO: Check if this is correct
                         
@@ -473,10 +474,14 @@ def train(args):
         epoch_val_loss = val_loss / len(dev_loader)
         epoch_val_acc = val_accuracy / len(dev_loader)
         
+        scheduler.step(epoch_val_loss)
+        
         writer.add_scalar("Val/Global_Acc", epoch_val_acc, epoch_num+1)
         writer.add_scalar("Val/Loss", epoch_val_loss, epoch_num+1)
         
         if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
+            
             state = model.state_dict()
             
             if args.use_arc_margin or args.use_sub_center_arc_margin:         
