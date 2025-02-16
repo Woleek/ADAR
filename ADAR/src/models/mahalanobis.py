@@ -43,11 +43,16 @@ class MahalanobisOODDetector(OODDetector):
         cov = np.cov(X, rowvar=False)
         reg = 1e-6 * np.eye(cov.shape[0])
         cov += reg
-        inv_cov = np.linalg.inv(cov)
-        self.inv_cov = torch.tensor(inv_cov, dtype=torch.float32, device=feats_train.device)
-        
+        # inv_cov = np.linalg.inv(cov)
+        # self.inv_cov = torch.tensor(inv_cov, dtype=torch.float32, device=feats_train.device)
+        cov = torch.tensor(cov, dtype=torch.float32, device=feats_train.device)
+        L = torch.linalg.cholesky(cov)
+        inv_cov = torch.cholesky_inverse(L)
+        self.inv_cov = inv_cov
+                
         # Compute per-class means
         unique_labels = np.unique(self.train_labels)
+        unique_labels = np.sort(unique_labels)
         self.class_means = {}
         for label in unique_labels:
             mask = (np.array(train_labels) == label)
@@ -82,11 +87,16 @@ class HierMahalanobisOODDetector(OODDetector):
         cov = np.cov(X, rowvar=False)
         reg = 1e-6 * np.eye(cov.shape[0])
         cov += reg
-        inv_cov = np.linalg.inv(cov)
-        self.inv_cov = torch.tensor(inv_cov, dtype=torch.float32, device=feats_train.device)
+        # inv_cov = np.linalg.inv(cov)
+        # self.inv_cov = torch.tensor(inv_cov, dtype=torch.float32, device=feats_train.device)
+        cov = torch.tensor(cov, dtype=torch.float32, device=feats_train.device)
+        L = torch.linalg.cholesky(cov)
+        inv_cov = torch.cholesky_inverse(L)
+        self.inv_cov = inv_cov
         
         # Compute per-class (global) means
         unique_labels = np.unique(self.train_labels)
+        unique_labels = np.sort(unique_labels)
         self.class_means = {}
         for label in unique_labels:
             mask = (np.array(train_labels) == label)
